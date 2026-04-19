@@ -225,75 +225,45 @@ Return ONLY valid compact JSON, no markdown, no explanation."""
 @app_mcp.tool()
 def generate_synthetic_events(analysis_json: str, count: int = 5) -> str:
     """Given the output of analyze_yara_l_rule, generate synthetic UDM events that will
-    trigger the rule. Returns a list of UDM event objects ready for Chronicle ingestion."""
+    trigger the rule. Returns events as JSON strings ready for ingest_log(log_type='UDM')."""
     try:
         analysis = json.loads(analysis_json) if isinstance(analysis_json, str) else analysis_json
     except Exception:
         analysis = {"trigger_summary": analysis_json}
 
-    prompt = f"""Generate exactly {count} synthetic UDM (Unified Data Model) events in JSON format
-that together will trigger this YARA-L rule.
+    prompt = f"""Generate exactly {count} synthetic UDM events in JSON format to trigger this YARA-L rule.
 
 Rule analysis:
 {json.dumps(analysis, indent=2)}
 
-STRICT UDM SCHEMA RULES — violating these causes ingestion to fail:
+UDM field reference:
+- metadata.event_type: e.g. "NETWORK_CONNECTION", "PROCESS_LAUNCH", "USER_LOGIN", "FILE_CREATION", "NETWORK_DNS", "STATUS_UPDATE"
+- metadata.event_timestamp: RFC3339 e.g. "2025-01-15T10:30:00Z"
+- metadata.product_name: string
+- principal/target/src: ip (array of strings), hostname (string), port (integer), url (string)
+- principal/target.user.userid: string
+- principal/target.process.command_line: string
+- principal/target.process.file.full_path: string
+- network.application_protocol: e.g. "HTTP", "HTTPS", "DNS", "SSH", "SMB"
+- network.direction: "INBOUND", "OUTBOUND", or "UNKNOWN_DIRECTION"
+- network.ip_protocol: "TCP", "UDP", or "ICMP"
+- network.http.method: string; network.http.response_code: integer
+- network.dns.questions: array of objects with name (string) and type (integer: 1=A, 28=AAAA)
 
-metadata fields (all optional except event_type):
-  event_type: string enum e.g. "NETWORK_CONNECTION", "PROCESS_LAUNCH", "USER_LOGIN", "FILE_CREATION", "NETWORK_DNS", "STATUS_UPDATE"
-  event_timestamp: RFC3339 string e.g. "2024-01-15T10:30:00Z"
-  product_name: string
-  vendor_name: string
-  description: string
-  DO NOT include: id (system generated), ingestion_labels (not supported)
+Rules:
+- Each event MUST satisfy the conditions in required_fields
+- Use fake but realistic values: IPs 10.0.0.x, hostnames WORKSTATION-01, users jsmith@test.local
+- For rules with entity joins, use consistent IPs/hostnames across events
+- ip fields must be arrays of strings: ["10.0.0.1"]
+- port fields must be integers, not strings
 
-principal / target / src / intermediary / observer fields:
-  ip: array of strings e.g. ["10.0.0.1"]
-  hostname: string
-  port: integer (not string)
-  mac: array of strings
-  user.userid: string
-  user.user_display_name: string
-  user.email_addresses: array of strings
-  process.command_line: string
-  process.file.full_path: string
-  DO NOT include: process.pid (causes type errors)
-  asset.hostname: string
-  asset.ip: array of strings
-
-network fields:
-  application_protocol: string enum e.g. "HTTP", "HTTPS", "DNS", "SMB", "SSH", "FTP", "SMTP"
-  direction: string enum "INBOUND", "OUTBOUND", "UNKNOWN_DIRECTION"
-  ip_protocol: string enum "TCP", "UDP", "ICMP"
-  http.method: string e.g. "GET", "POST"
-  http.response_code: INTEGER e.g. 200 (NOT status_code, NOT a string)
-  http.user_agent: string
-  http.referral_url: string
-  DO NOT put URL in network.http — HTTP target URLs go in target.url (string) instead
-  dns.questions: array of objects with name (string) and type (INTEGER: 1=A, 28=AAAA, 5=CNAME, 15=MX, 2=NS, 16=TXT)
-  dns.answers: array of objects with name (string), type (INTEGER), data (string), ttl (integer)
-
-DO NOT include security_result or extensions — these contain enum fields with strict protobuf
-validation that cannot be safely generated. They are not needed to trigger detection rules.
-
-Requirements:
-- Each event MUST satisfy the field conditions in required_fields
-- Use realistic but fake values (IPs like 10.0.0.x, hostnames like test-host-01)
-- If the rule requires multiple event types or entity joins, generate correlated events
-  (same principal.ip or hostname across events as needed)
-- All integer fields MUST be integers, not strings
-
-Return ONLY a valid JSON array of UDM event objects. No markdown, no explanation."""
+Return ONLY a JSON array of UDM event objects. No markdown, no explanation."""
 
     try:
-        result = _gemini(prompt)
+        result = _gemini(prompt, max_tokens=8192)
         events = _extract_json(result)
         if not isinstance(events, list):
             events = [events]
-        # Stamp each event with a test marker
-        for e in events:
-            e.setdefault("metadata", {})
-            e["metadata"]["product_name"] = "YARAL_VALIDATOR_SYNTHETIC"
         return json.dumps({"events": events, "count": len(events)})
     except Exception as ex:
         return json.dumps({"error": str(ex)})
@@ -331,9 +301,43 @@ def _sanitize_udm_event(e: dict) -> dict:
             else:
                 noun_obj.pop("port")
 
-    # network.http — valid fields only; url lives at target.url not here
+    # Normalize ip fields — UDM ip is a repeated field (must be array)
+    for noun in ("principal", "target", "src", "intermediary", "observer", "about"):
+        noun_obj = e.get(noun)
+        if not isinstance(noun_obj, dict):
+            continue
+        for ip_field in ("ip", "mac"):
+            val = noun_obj.get(ip_field)
+            if isinstance(val, str):
+                noun_obj[ip_field] = [val]
+        # asset.ip same treatment
+        asset = noun_obj.get("asset")
+        if isinstance(asset, dict):
+            val = asset.get("ip")
+            if isinstance(val, str):
+                asset["ip"] = [val]
+
+    # network — validate enum fields and clean up http/dns
+    VALID_APP_PROTO = {
+        "UNKNOWN_APPLICATION_PROTOCOL", "HTTP", "HTTPS", "DNS", "FTP", "SSH",
+        "SMB", "SMTP", "IMAP", "POP3", "TELNET", "LDAP", "KERBEROS", "RDP",
+        "NFS", "DHCP", "SNMP", "SYSLOG", "TLS", "QUIC",
+    }
+    VALID_DIRECTION = {"UNKNOWN_DIRECTION", "INBOUND", "OUTBOUND", "BOTH"}
+    VALID_IP_PROTO  = {"UNKNOWN_IP_PROTOCOL", "TCP", "UDP", "ICMP", "HOPOPT",
+                       "IGMP", "ESP", "GRE", "SCTP", "IPV6"}
+
     network = e.get("network")
     if isinstance(network, dict):
+        for fld, valid_set in (
+            ("application_protocol", VALID_APP_PROTO),
+            ("direction",            VALID_DIRECTION),
+            ("ip_protocol",          VALID_IP_PROTO),
+        ):
+            val = network.get(fld)
+            if val is not None and val not in valid_set:
+                network.pop(fld)
+
         http = network.get("http")
         if isinstance(http, dict):
             # Move any URL field to target.url
@@ -354,9 +358,8 @@ def _sanitize_udm_event(e: dict) -> dict:
                     http["response_code"] = converted
                 else:
                     http.pop("response_code")
-            # Strip any remaining unknown http fields
-            VALID_HTTP = {"method", "response_code", "user_agent", "referral_url",
-                          "parsed_user_agent", "response_code"}
+            # Whitelist: only simple scalar string/int fields
+            VALID_HTTP = {"method", "response_code", "user_agent", "referral_url"}
             for k in list(http.keys()):
                 if k not in VALID_HTTP:
                     http.pop(k)
@@ -381,45 +384,52 @@ def _sanitize_udm_event(e: dict) -> dict:
 
 @app_mcp.tool()
 def ingest_synthetic_events(events_json: str) -> str:
-    """Ingest synthetic UDM events into Chronicle for rule testing.
-    Accepts the output of generate_synthetic_events or a raw JSON array of UDM events.
+    """Ingest synthetic logs into SecOps for rule testing.
+    Accepts the output of generate_synthetic_events (raw logs + log_type).
+    Uses ingest_log so SecOps's own parsers handle UDM conversion — no enum issues.
     Returns ingestion status and a validation_id to track this test run."""
     try:
         data = json.loads(events_json) if isinstance(events_json, str) else events_json
-        events = data.get("events", data) if isinstance(data, dict) else data
-        if not isinstance(events, list):
-            return json.dumps({"error": "Expected a list of UDM events"})
 
-        validation_id = f"yaral-test-{uuid.uuid4().hex[:12]}"
-        ingestion_time = datetime.now(timezone.utc).isoformat()
-
-        # Stamp, sanitize, and fix type issues on each event
-        for i, e in enumerate(events):
-            e.setdefault("metadata", {})
-            e["metadata"]["product_name"] = "YARAL_VALIDATOR_SYNTHETIC"
-            e["metadata"]["description"] = f"Synthetic validation event — {validation_id}"
-            if "event_timestamp" not in e["metadata"]:
-                e["metadata"]["event_timestamp"] = ingestion_time
-            events[i] = _sanitize_udm_event(e)
-
-        import google.auth, google.auth.transport.requests
-        creds, _ = google.auth.default(scopes=["https://www.googleapis.com/auth/cloud-platform"])
         from secops import SecOpsClient
-        from secops.auth import SecOpsAuth
-        client = SecOpsClient(credentials=creds).chronicle(
+        client = SecOpsClient().chronicle(
             customer_id=SECOPS_CUSTOMER_ID,
             project_id=SECOPS_PROJECT_ID,
             region=SECOPS_REGION,
         )
-        result = client.ingest_udm(events)
+
+        validation_id = f"yaral-test-{uuid.uuid4().hex[:12]}"
+        ingestion_time = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+
+        # Accept {events: [...]} from generate_synthetic_events
+        if isinstance(data, dict) and "events" in data:
+            events = data["events"]
+        elif isinstance(data, list):
+            events = data
+        else:
+            return json.dumps({"error": "Expected {events: [...]} from generate_synthetic_events"})
+
+        if not isinstance(events, list) or not events:
+            return json.dumps({"error": "No events to ingest"})
+
+        # Serialize each UDM event as a JSON string — ingest_log(log_type="UDM") accepts
+        # pre-formed UDM JSON strings and bypasses the strict enum validation of ingest_udm
+        log_messages = [json.dumps(e) for e in events]
+        logger.info(f"Ingesting {len(log_messages)} UDM events via ingest_log — first: {log_messages[0][:400]}")
+        result = client.ingest_log(
+            log_type="UDM",
+            log_message=log_messages,
+            force_log_type=True,
+        )
         return json.dumps({
             "status": "ingested",
             "validation_id": validation_id,
             "event_count": len(events),
             "ingestion_time": ingestion_time,
             "api_response": result,
-            "message": f"Ingested {len(events)} synthetic events via SecOps SDK. Wait 2-5 min then verify."
+            "message": f"Ingested {len(events)} UDM events via ingest_log. Wait 2-5 min then verify.",
         })
+
     except Exception as e:
         return json.dumps({"error": str(e)})
 
