@@ -91,48 +91,97 @@ def _verify_google_token(request: Request) -> str | None:
         logger.warning(f"Token verify failed: {e}")
         return None
 
+def _repair_json(text: str) -> str:
+    """Apply a sequence of repairs to make Gemini output parseable as JSON."""
+    # Fix invalid escape sequences: \x where x is not a valid JSON escape char
+    text = re.sub(r'\\(?!["\\/bfnrtu0-9])', r'\\\\', text)
+    # Fix unescaped literal newlines/tabs inside JSON string values
+    # Walk char by char to replace bare \n \r \t inside strings
+    out = []
+    in_str = False
+    escape_next = False
+    for ch in text:
+        if escape_next:
+            out.append(ch)
+            escape_next = False
+        elif ch == '\\' and in_str:
+            out.append(ch)
+            escape_next = True
+        elif ch == '"':
+            out.append(ch)
+            in_str = not in_str
+        elif in_str and ch == '\n':
+            out.append('\\n')
+        elif in_str and ch == '\r':
+            out.append('\\r')
+        elif in_str and ch == '\t':
+            out.append('\\t')
+        else:
+            out.append(ch)
+    text = ''.join(out)
+    # Trailing commas before } or ]
+    text = re.sub(r',\s*([}\]])', r'\1', text)
+    # Python literals → JSON
+    text = re.sub(r'\bNone\b', 'null', text)
+    text = re.sub(r'\bTrue\b', 'true', text)
+    text = re.sub(r'\bFalse\b', 'false', text)
+    return text
+
+
 def _extract_json(text: str) -> any:
-    """Strip markdown fences and parse JSON, repairing common escape issues."""
-    # Remove ```json ... ``` or ``` ... ``` blocks
+    """Strip markdown fences and parse JSON, repairing common Gemini output issues."""
+    # Remove ```json ... ``` fences
     text = re.sub(r'^```(?:json)?\s*', '', text.strip(), flags=re.MULTILINE)
     text = re.sub(r'\s*```\s*$', '', text, flags=re.MULTILINE)
     text = text.strip()
-    # Try direct parse first
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        pass
-    # Extract the outermost { } or [ ] block
-    for start_ch, end_ch in [('{', '}'), ('[', ']')]:
+
+    # Determine which bracket type appears outermost (first in the text)
+    first_brace  = text.find('{')
+    first_bracket = text.find('[')
+    if first_bracket != -1 and (first_brace == -1 or first_bracket < first_brace):
+        order = [('[', ']'), ('{', '}')]
+    else:
+        order = [('{', '}'), ('[', ']')]
+
+    last_error = None
+    for start_ch, end_ch in order:
         start = text.find(start_ch)
         end = text.rfind(end_ch)
-        if start != -1 and end > start:
-            candidate = text[start:end + 1]
+        if start == -1 or end <= start:
+            continue
+        candidate = text[start:end + 1]
+        for attempt in (candidate, _repair_json(candidate)):
             try:
-                return json.loads(candidate)
-            except json.JSONDecodeError:
-                # Fix invalid escape sequences (e.g. \b \p \/ not valid in JSON strings)
-                fixed = re.sub(r'(?<!\\)\\(?!["\\/bfnrtu])', r'\\\\', candidate)
-                try:
-                    return json.loads(fixed)
-                except json.JSONDecodeError:
-                    pass
-    raise ValueError(f"Could not extract valid JSON from Gemini response: {text[:200]}")
+                return json.loads(attempt)
+            except json.JSONDecodeError as exc:
+                last_error = exc
+
+    raise ValueError(
+        f"Could not extract valid JSON from Gemini response "
+        f"(last error: {last_error}): {text[:300]}"
+    )
 
 
-def _gemini(prompt: str, system: str = "") -> str:
+def _gemini(prompt: str, system: str = "", max_tokens: int = 8192) -> str:
     """Call Gemini and return text."""
     token = _get_adc_token()
     url = (f"https://us-central1-aiplatform.googleapis.com/v1/projects/{SECOPS_PROJECT_ID}"
            f"/locations/us-central1/publishers/google/models/{GEMINI_MODEL}:generateContent")
-    body: dict = {"contents": [{"role": "user", "parts": [{"text": prompt}]}]}
+    body: dict = {
+        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+        "generationConfig": {"maxOutputTokens": max_tokens, "temperature": 0.1},
+    }
     if system:
         body["systemInstruction"] = {"parts": [{"text": system}]}
     resp = requests.post(url, headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-                         json=body, timeout=60)
+                         json=body, timeout=120)
     if resp.status_code != 200:
         raise RuntimeError(f"Gemini error {resp.status_code}: {resp.text[:300]}")
-    parts = resp.json().get("candidates", [{}])[0].get("content", {}).get("parts", [])
+    candidate = resp.json().get("candidates", [{}])[0]
+    finish_reason = candidate.get("finishReason", "")
+    if finish_reason == "MAX_TOKENS":
+        logger.warning("Gemini response hit MAX_TOKENS limit — output may be truncated")
+    parts = candidate.get("content", {}).get("parts", [])
     return "".join(p.get("text", "") for p in parts)
 
 # ═══════════════════════════════════════════════════════════════
@@ -143,24 +192,26 @@ def _gemini(prompt: str, system: str = "") -> str:
 def analyze_yara_l_rule(rule_text: str) -> str:
     """Analyze a YARA-L rule and extract what UDM events, field conditions, and entity
     relationships are needed to trigger it. Returns structured analysis with trigger requirements."""
-    prompt = f"""Analyze this YARA-L rule and return a JSON object with these fields:
-- rule_name: the rule name
-- description: what threat this rule detects
-- event_variables: list of event variable names (e.g. $e, $e1, $e2)
-- required_events: list of objects with {{variable, event_type, description}}
-- required_fields: list of objects with {{field, operator, value, description}}
-- entity_joins: any joins between event variables (e.g. $e1.principal.ip = $e2.target.ip)
-- time_window: match time window if any
-- outcome_fields: any outcome variables set
-- trigger_summary: plain English — exactly what sequence of events triggers this rule
-- synthetic_event_hints: specific field values to use when generating test events
+    prompt = f"""Analyze this YARA-L rule. Return a compact JSON object with ONLY these fields:
+- rule_name: string
+- description: string (max 200 chars, single line)
+- event_variables: array of strings (variable names only, e.g. ["$e1","$e2"])
+- required_events: array of {{variable, event_type}} objects only (no description field)
+- required_fields: array of {{field, operator, value}} objects (no description, max 20 entries)
+- entity_joins: array of strings describing joins (e.g. "$e1.principal.ip = $e2.target.ip")
+- time_window: string or null
+- trigger_summary: string (max 300 chars, single line)
+- synthetic_event_hints: object with key=variable name, value=object of field:value pairs to use
+
+Keep ALL string values on a single line. No literal newlines inside strings. Escape backslashes.
+For complex rules with many event variables, focus on the MINIMUM subset needed to trigger the rule.
 
 YARA-L Rule:
 ```
 {rule_text}
 ```
 
-Return ONLY valid JSON, no markdown."""
+Return ONLY valid compact JSON, no markdown, no explanation."""
 
     try:
         result = _gemini(prompt)
@@ -186,15 +237,51 @@ that together will trigger this YARA-L rule.
 Rule analysis:
 {json.dumps(analysis, indent=2)}
 
+STRICT UDM SCHEMA RULES — violating these causes ingestion to fail:
+
+metadata fields (all optional except event_type):
+  event_type: string enum e.g. "NETWORK_CONNECTION", "PROCESS_LAUNCH", "USER_LOGIN", "FILE_CREATION", "NETWORK_DNS", "STATUS_UPDATE"
+  event_timestamp: RFC3339 string e.g. "2024-01-15T10:30:00Z"
+  product_name: string
+  vendor_name: string
+  description: string
+  DO NOT include: id (system generated), ingestion_labels (not supported)
+
+principal / target / src / intermediary / observer fields:
+  ip: array of strings e.g. ["10.0.0.1"]
+  hostname: string
+  port: integer (not string)
+  mac: array of strings
+  user.userid: string
+  user.user_display_name: string
+  user.email_addresses: array of strings
+  process.command_line: string
+  process.file.full_path: string
+  DO NOT include: process.pid (causes type errors)
+  asset.hostname: string
+  asset.ip: array of strings
+
+network fields:
+  application_protocol: string enum e.g. "HTTP", "HTTPS", "DNS", "SMB", "SSH", "FTP", "SMTP"
+  direction: string enum "INBOUND", "OUTBOUND", "UNKNOWN_DIRECTION"
+  ip_protocol: string enum "TCP", "UDP", "ICMP"
+  http.method: string e.g. "GET", "POST"
+  http.response_code: INTEGER e.g. 200 (NOT status_code, NOT a string)
+  http.user_agent: string
+  http.referral_url: string
+  DO NOT put URL in network.http — HTTP target URLs go in target.url (string) instead
+  dns.questions: array of objects with name (string) and type (INTEGER: 1=A, 28=AAAA, 5=CNAME, 15=MX, 2=NS, 16=TXT)
+  dns.answers: array of objects with name (string), type (INTEGER), data (string), ttl (integer)
+
+DO NOT include security_result or extensions — these contain enum fields with strict protobuf
+validation that cannot be safely generated. They are not needed to trigger detection rules.
+
 Requirements:
 - Each event MUST satisfy the field conditions in required_fields
 - Use realistic but fake values (IPs like 10.0.0.x, hostnames like test-host-01)
-- Include metadata.event_timestamp in RFC3339 format (within last 10 minutes)
-- Include metadata.id as a unique UUID per event
-- Include metadata.product_name: "SYNTHETIC_TEST"
-- Include metadata.ingestion_labels: {{"validation_id": "yaral-test-{uuid.uuid4().hex[:8]}"}}
 - If the rule requires multiple event types or entity joins, generate correlated events
   (same principal.ip or hostname across events as needed)
+- All integer fields MUST be integers, not strings
 
 Return ONLY a valid JSON array of UDM event objects. No markdown, no explanation."""
 
@@ -212,6 +299,86 @@ Return ONLY a valid JSON array of UDM event objects. No markdown, no explanation
         return json.dumps({"error": str(ex)})
 
 
+def _to_int(val, fallback=None):
+    try:
+        return int(val)
+    except (ValueError, TypeError):
+        return fallback
+
+
+def _sanitize_udm_event(e: dict) -> dict:
+    """Strip fields that fail UDM schema validation and fix type mismatches."""
+    # metadata — strip fields that cause ingestion failures
+    meta = e.get("metadata", {})
+    meta.pop("ingestion_labels", None)
+    # metadata.id must be a valid plain UUID — strip it, SDK will generate a correct one
+    meta.pop("id", None)
+    e["metadata"] = meta
+
+    # Strip process.pid entirely — it must be uint32 but Gemini consistently
+    # generates it as a string and it is not needed to trigger detection rules
+    for noun in ("principal", "target", "src", "intermediary", "observer", "about"):
+        noun_obj = e.get(noun)
+        if not isinstance(noun_obj, dict):
+            continue
+        proc = noun_obj.get("process")
+        if isinstance(proc, dict):
+            proc.pop("pid", None)
+        if "port" in noun_obj:
+            converted = _to_int(noun_obj["port"])
+            if converted is not None:
+                noun_obj["port"] = converted
+            else:
+                noun_obj.pop("port")
+
+    # network.http — valid fields only; url lives at target.url not here
+    network = e.get("network")
+    if isinstance(network, dict):
+        http = network.get("http")
+        if isinstance(http, dict):
+            # Move any URL field to target.url
+            url_val = http.pop("url", None) or http.pop("request_url", None)
+            if url_val and isinstance(e.get("target"), dict):
+                e["target"].setdefault("url", url_val)
+            elif url_val:
+                e.setdefault("target", {})["url"] = url_val
+            # Fix status_code → response_code as integer
+            if "status_code" in http:
+                val = http.pop("status_code")
+                converted = _to_int(val)
+                if converted is not None:
+                    http["response_code"] = converted
+            if "response_code" in http:
+                converted = _to_int(http["response_code"])
+                if converted is not None:
+                    http["response_code"] = converted
+                else:
+                    http.pop("response_code")
+            # Strip any remaining unknown http fields
+            VALID_HTTP = {"method", "response_code", "user_agent", "referral_url",
+                          "parsed_user_agent", "response_code"}
+            for k in list(http.keys()):
+                if k not in VALID_HTTP:
+                    http.pop(k)
+
+    # network.dns — type must be integer
+    for dns_list in ("questions", "answers"):
+        for entry in e.get("network", {}).get("dns", {}).get(dns_list, []):
+            if "type" in entry and isinstance(entry["type"], str):
+                dns_type_map = {"A": 1, "NS": 2, "CNAME": 5, "MX": 15, "AAAA": 28, "TXT": 16, "PTR": 12}
+                entry["type"] = dns_type_map.get(entry["type"].upper(), 1)
+
+    # security_result and extensions contain deeply nested enum fields that the SecOps
+    # protobuf strictly validates. Gemini consistently generates values that look valid
+    # but are rejected by the API. These fields are never required to trigger a YARA-L
+    # rule (rules fire on event_type + principal/target/network conditions), so we strip
+    # them entirely to eliminate this entire class of ingestion failures.
+    e.pop("security_result", None)
+    e.pop("extensions", None)
+
+    return e
+
+
 @app_mcp.tool()
 def ingest_synthetic_events(events_json: str) -> str:
     """Ingest synthetic UDM events into Chronicle for rule testing.
@@ -226,13 +393,14 @@ def ingest_synthetic_events(events_json: str) -> str:
         validation_id = f"yaral-test-{uuid.uuid4().hex[:12]}"
         ingestion_time = datetime.now(timezone.utc).isoformat()
 
-        # Stamp all events with the validation ID for later lookup
-        for e in events:
+        # Stamp, sanitize, and fix type issues on each event
+        for i, e in enumerate(events):
             e.setdefault("metadata", {})
             e["metadata"]["product_name"] = "YARAL_VALIDATOR_SYNTHETIC"
-            e["metadata"].setdefault("ingestion_labels", {})["validation_id"] = validation_id
+            e["metadata"]["description"] = f"Synthetic validation event — {validation_id}"
             if "event_timestamp" not in e["metadata"]:
                 e["metadata"]["event_timestamp"] = ingestion_time
+            events[i] = _sanitize_udm_event(e)
 
         import google.auth, google.auth.transport.requests
         creds, _ = google.auth.default(scopes=["https://www.googleapis.com/auth/cloud-platform"])
