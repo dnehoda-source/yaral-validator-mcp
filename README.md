@@ -4,28 +4,42 @@ A detection engineering tool that validates YARA-L rules against Google SecOps b
 
 ## The Problem
 
-Enterprise security teams write YARA-L detection rules to catch threats — lateral movement, data exfiltration, privilege escalation, malware behavior. But once a rule is written and deployed, how do you know it actually works?
+Google SecOps has test rule and retrohunt — both useful, but both require existing production data to run against. That works in a live environment.
 
-The traditional answer is: you wait. You wait until a real attack happens, the rule either fires or doesn't, and only then do you discover that a field name was wrong, a condition was too strict, or the event type never appears in your environment the way you expected. By then, you've already had an incident — or worse, missed one silently.
+It does not work during a SIEM migration.
 
-This is not a sustainable model for enterprise security infrastructure. Detection rules that have never been validated are not detections. They're assumptions written in code.
+When you're converting a customer from a legacy SIEM to SecOps, you have no historical events, no ingested logs, and no production data. You're configuring an entire detection layer on an empty environment with no way to verify that a converted YARA-L rule will actually fire, generate a detection, and surface a case for investigation. You find out if it works when real data starts flowing — which is also when it matters most.
 
-**The gap is real:**
-- SecOps doesn't generate synthetic traffic for you
-- Unit testing frameworks don't exist for YARA-L at scale
-- Manually crafting UDM events to test a rule requires deep platform knowledge and hours of work
-- Most teams ship rules directly to production with no validation step at all
+That's not a testing strategy. That's a liability handed to the customer at go-live.
+
+**The gap exists because:**
+- Test rule and retrohunt require data that doesn't exist yet in a new environment
+- Manually crafting UDM events to test a rule requires deep platform knowledge and significant time per rule
+- A rule can be syntactically valid, pass a linter, and still never fire because a field mapping is wrong or a condition doesn't match how the data source actually formats events
+- There is no standard validation step in the SIEM migration workflow — rules are converted and shipped with the assumption they work
 
 ## What It Does
 
-This server closes that gap with a fully automated validation pipeline:
+This server adds a validation step to the migration workflow. You paste a converted YARA-L rule, it analyzes the exact UDM field conditions required to trigger it, generates synthetic correlated events that satisfy those conditions, ingests them into SecOps, and verifies that a detection fires and a case is created — no production data required.
 
 1. **Analyze** — Parses your YARA-L rule and extracts the exact UDM field conditions, event types, and entity joins required to trigger it
 2. **Generate** — Uses Gemini to synthesize realistic UDM events that satisfy those conditions
 3. **Ingest** — Sends the events into your SecOps instance via the SecOps SDK
-4. **Verify** — Polls SecOps detections to confirm the rule fired on the synthetic traffic
+4. **Verify** — Confirms a detection fired and a case was created
 
-You go from "I think this rule works" to "I have proof this rule works" — before anything reaches production. Detection engineering becomes testable, repeatable, and auditable. Security teams can validate rules on demand, regression-test after platform updates, and build confidence in their detection coverage without waiting for an attacker to do it for them.
+**The migration validation workflow becomes:**
+
+```
+Convert rule from legacy SIEM → YARA-L
+         ↓
+Run through YARA-L Validator
+         ↓
+Confirm detection fires and case is created
+         ↓
+Ship with confidence
+```
+
+You go from "I assume this rule works" to "I have proof this rule works" — before the customer's data ever touches the environment.
 
 ## Architecture
 
