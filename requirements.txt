@@ -1,0 +1,6 @@
+fastapi>=0.104.0
+uvicorn>=0.24.0
+requests>=2.31.0
+google-auth>=2.28.1
+secops>=0.39.0
+mcp>=1.0.0

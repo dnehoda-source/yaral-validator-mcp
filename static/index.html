@@ -1,0 +1,742 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>YARA-L Detection Validator</title>
+<script src="https://accounts.google.com/gsi/client" async></script>
+<style>
+  :root {
+    --bg: #0a0f1e;
+    --surface: #111827;
+    --surface2: #1a2236;
+    --border: #1e3a5f;
+    --accent: #00d4ff;
+    --accent2: #00ff88;
+    --accent3: #7c3aed;
+    --danger: #ef4444;
+    --warn: #f59e0b;
+    --text: #e2e8f0;
+    --muted: #64748b;
+    --font: 'Courier New', monospace;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--text); font-family: var(--font); min-height: 100vh; display: flex; flex-direction: column; }
+
+  /* LOGIN OVERLAY */
+  #login-overlay {
+    position: fixed; inset: 0; background: rgba(10,15,30,0.97); z-index: 1000;
+    display: none; align-items: center; justify-content: center; flex-direction: column; gap: 24px;
+  }
+  #login-overlay.visible { display: flex; }
+  .login-box {
+    background: var(--surface); border: 1px solid var(--accent); border-radius: 12px;
+    padding: 48px 40px; text-align: center; max-width: 400px; width: 90%;
+    box-shadow: 0 0 60px rgba(0,212,255,0.2);
+  }
+  .login-logo { font-size: 2.5rem; margin-bottom: 8px; }
+  .login-box h2 { color: var(--accent); font-size: 1.4rem; margin-bottom: 6px; }
+  .login-box p { color: var(--muted); font-size: 0.85rem; margin-bottom: 28px; }
+  .login-divider { border: none; border-top: 1px solid var(--border); margin: 20px 0; }
+  #google-signin-btn { margin-top: 8px; }
+
+  /* HEADER */
+  header {
+    background: var(--surface); border-bottom: 1px solid var(--border);
+    padding: 12px 20px; display: flex; align-items: center; justify-content: space-between;
+    position: sticky; top: 0; z-index: 100;
+  }
+  .header-brand { display: flex; align-items: center; gap: 10px; }
+  .header-brand .icon { font-size: 1.4rem; }
+  .header-brand h1 { font-size: 1rem; color: var(--accent); letter-spacing: 1px; }
+  .header-brand .sub { font-size: 0.7rem; color: var(--muted); }
+  .header-right { display: flex; align-items: center; gap: 12px; }
+  .status-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--accent2); box-shadow: 0 0 6px var(--accent2); }
+  .status-label { font-size: 0.75rem; color: var(--muted); }
+
+  /* USER PILL */
+  #user-pill { display: none; align-items: center; gap: 8px; background: var(--surface2); border: 1px solid var(--border); border-radius: 20px; padding: 4px 12px 4px 4px; }
+  #user-pill.visible { display: flex; }
+  .user-avatar { width: 28px; height: 28px; border-radius: 50%; background: var(--accent3); display: flex; align-items: center; justify-content: center; font-size: 0.75rem; font-weight: bold; color: #fff; }
+  .user-email { font-size: 0.75rem; color: var(--text); }
+  .signout-btn { background: none; border: none; color: var(--muted); cursor: pointer; font-size: 0.8rem; padding: 2px 4px; }
+  .signout-btn:hover { color: var(--danger); }
+
+  /* LAYOUT */
+  .app { display: grid; grid-template-columns: 380px 1fr 340px; flex: 1; min-height: 0; height: calc(100vh - 57px); }
+
+  /* LEFT PANEL — Rule Input */
+  .panel-left {
+    background: var(--surface); border-right: 1px solid var(--border);
+    display: flex; flex-direction: column; overflow: hidden;
+  }
+  .panel-header {
+    padding: 12px 16px; border-bottom: 1px solid var(--border);
+    font-size: 0.75rem; color: var(--accent); letter-spacing: 1px; text-transform: uppercase;
+    display: flex; align-items: center; gap: 8px;
+  }
+  .rule-textarea {
+    flex: 1; background: var(--bg); border: none; outline: none; resize: none;
+    color: var(--accent2); font-family: var(--font); font-size: 0.8rem; padding: 12px;
+    line-height: 1.5;
+  }
+  .rule-textarea::placeholder { color: var(--muted); }
+
+  .action-bar { padding: 12px; border-top: 1px solid var(--border); display: flex; flex-direction: column; gap: 8px; }
+  .rule-name-row { display: flex; gap: 8px; align-items: center; }
+  .rule-name-input {
+    flex: 1; background: var(--surface2); border: 1px solid var(--border); border-radius: 6px;
+    color: var(--text); font-family: var(--font); font-size: 0.8rem; padding: 6px 10px; outline: none;
+  }
+  .rule-name-input:focus { border-color: var(--accent); }
+  .rule-name-input::placeholder { color: var(--muted); }
+  .btn {
+    background: transparent; border: 1px solid var(--accent); color: var(--accent);
+    padding: 8px 14px; border-radius: 6px; cursor: pointer; font-family: var(--font);
+    font-size: 0.8rem; transition: all 0.2s; display: flex; align-items: center; gap: 6px;
+    justify-content: center;
+  }
+  .btn:hover { background: var(--accent); color: var(--bg); }
+  .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+  .btn.primary { border-color: var(--accent2); color: var(--accent2); }
+  .btn.primary:hover { background: var(--accent2); color: var(--bg); }
+  .btn.full { width: 100%; }
+  .btn-row { display: flex; gap: 8px; }
+
+  /* MIDDLE PANEL — Results */
+  .panel-mid {
+    display: flex; flex-direction: column; overflow: hidden;
+  }
+  .results-area { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 16px; }
+
+  .result-card {
+    background: var(--surface); border: 1px solid var(--border); border-radius: 8px; overflow: hidden;
+    animation: fadeIn 0.3s ease;
+  }
+  @keyframes fadeIn { from { opacity:0; transform: translateY(8px); } to { opacity:1; transform: translateY(0); } }
+  .result-card-header {
+    padding: 10px 14px; display: flex; align-items: center; justify-content: space-between;
+    border-bottom: 1px solid var(--border); cursor: pointer;
+  }
+  .result-card-header h3 { font-size: 0.8rem; color: var(--accent); }
+  .result-card-header .badge {
+    font-size: 0.7rem; padding: 2px 8px; border-radius: 10px; background: var(--surface2);
+    border: 1px solid var(--border);
+  }
+  .badge.ok { border-color: var(--accent2); color: var(--accent2); }
+  .badge.warn { border-color: var(--warn); color: var(--warn); }
+  .badge.err { border-color: var(--danger); color: var(--danger); }
+  .badge.info { border-color: var(--accent); color: var(--accent); }
+  .result-card-body { padding: 12px 14px; }
+  .result-card-body pre {
+    font-size: 0.75rem; color: var(--text); overflow-x: auto; white-space: pre-wrap;
+    word-break: break-word; line-height: 1.5;
+  }
+  .collapse-toggle { font-size: 0.75rem; color: var(--muted); }
+
+  .empty-state {
+    flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: 12px; color: var(--muted);
+  }
+  .empty-state .icon { font-size: 3rem; opacity: 0.3; }
+  .empty-state p { font-size: 0.85rem; }
+
+  /* Progress bar */
+  .progress-bar { background: var(--surface2); border-radius: 4px; height: 4px; overflow: hidden; margin: 8px 0; }
+  .progress-fill { height: 100%; background: linear-gradient(90deg, var(--accent), var(--accent2)); border-radius: 4px; transition: width 0.4s; }
+
+  /* Pipeline steps */
+  .pipeline { display: flex; gap: 0; margin: 12px 0; }
+  .pipe-step {
+    flex: 1; text-align: center; padding: 8px 4px; font-size: 0.7rem;
+    border: 1px solid var(--border); background: var(--surface2); position: relative;
+  }
+  .pipe-step:first-child { border-radius: 6px 0 0 6px; }
+  .pipe-step:last-child { border-radius: 0 6px 6px 0; }
+  .pipe-step.active { border-color: var(--accent); background: rgba(0,212,255,0.08); color: var(--accent); }
+  .pipe-step.done { border-color: var(--accent2); background: rgba(0,255,136,0.08); color: var(--accent2); }
+  .pipe-step.pending { color: var(--muted); }
+  .pipe-step .step-label { display: block; font-weight: bold; }
+
+  /* RIGHT PANEL — Chat */
+  .panel-right {
+    background: var(--surface); border-left: 1px solid var(--border);
+    display: flex; flex-direction: column; overflow: hidden;
+  }
+  .chat-msgs { flex: 1; overflow-y: auto; padding: 12px; display: flex; flex-direction: column; gap: 10px; }
+  .msg { display: flex; gap: 8px; animation: fadeIn 0.2s ease; }
+  .msg.user { flex-direction: row-reverse; }
+  .msg-bubble {
+    max-width: 85%; padding: 8px 12px; border-radius: 10px; font-size: 0.8rem; line-height: 1.5;
+    background: var(--surface2); border: 1px solid var(--border);
+  }
+  .msg.user .msg-bubble { background: rgba(0,212,255,0.1); border-color: var(--accent); color: var(--accent); }
+  .msg.assistant .msg-bubble { color: var(--text); }
+  .msg-avatar { width: 24px; height: 24px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 0.7rem; flex-shrink: 0; margin-top: 2px; }
+  .msg.user .msg-avatar { background: var(--accent3); color: #fff; }
+  .msg.assistant .msg-avatar { background: var(--surface2); color: var(--accent); border: 1px solid var(--border); }
+  .typing { display: flex; gap: 4px; align-items: center; padding: 4px 0; }
+  .typing span { width: 6px; height: 6px; background: var(--accent); border-radius: 50%; animation: blink 1s infinite; }
+  .typing span:nth-child(2) { animation-delay: 0.2s; }
+  .typing span:nth-child(3) { animation-delay: 0.4s; }
+  @keyframes blink { 0%,80%,100%{opacity:0.2} 40%{opacity:1} }
+
+  .chat-input-area { padding: 12px; border-top: 1px solid var(--border); display: flex; gap: 8px; }
+  .chat-input {
+    flex: 1; background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
+    color: var(--text); font-family: var(--font); font-size: 0.8rem; padding: 8px 10px;
+    outline: none; resize: none; min-height: 38px; max-height: 100px;
+  }
+  .chat-input:focus { border-color: var(--accent); }
+  .chat-send-btn { background: var(--accent); color: var(--bg); border: none; border-radius: 6px; padding: 8px 14px; cursor: pointer; font-family: var(--font); font-size: 0.8rem; font-weight: bold; }
+  .chat-send-btn:hover { opacity: 0.85; }
+  .chat-send-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+  /* Scrollbar */
+  ::-webkit-scrollbar { width: 6px; }
+  ::-webkit-scrollbar-track { background: var(--bg); }
+  ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+  ::-webkit-scrollbar-thumb:hover { background: var(--accent); }
+
+  /* Spinner */
+  .spinner { display: inline-block; width: 14px; height: 14px; border: 2px solid var(--border); border-top-color: var(--accent); border-radius: 50%; animation: spin 0.6s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  .section-divider { border: none; border-top: 1px solid var(--border); margin: 8px 0; }
+
+  /* Sticky pipeline bar */
+  #pipeline-sticky { border-bottom: 1px solid var(--border); background: var(--surface); }
+  #pipeline-sticky:empty { display: none; }
+  #pipeline-sticky .result-card { border: none; border-radius: 0; margin: 0; }
+  #pipeline-sticky .result-card-body { padding: 10px 14px 12px; }
+
+  /* Verification timer */
+  .verify-countdown { background: rgba(245,158,11,0.1); border: 1px solid var(--warn); border-radius: 8px; padding: 12px; font-size: 0.8rem; color: var(--warn); }
+  .verify-btn-row { display: flex; gap: 8px; margin-top: 10px; }
+</style>
+</head>
+<body>
+
+<!-- LOGIN OVERLAY -->
+<div id="login-overlay">
+  <div class="login-box">
+    <div class="login-logo">🔬</div>
+    <h2>YARA-L Validator</h2>
+    <p>Detection rule testing &amp; synthetic traffic generation</p>
+    <hr class="login-divider"/>
+    <div id="google-signin-btn"></div>
+  </div>
+</div>
+
+<!-- HEADER -->
+<header>
+  <div class="header-brand">
+    <span class="icon">🔬</span>
+    <div>
+      <h1>YARA-L DETECTION VALIDATOR</h1>
+      <div class="sub">Chronicle · Synthetic UDM · Rule Verification</div>
+    </div>
+  </div>
+  <div class="header-right">
+    <div class="status-dot"></div>
+    <span class="status-label">CONNECTED</span>
+    <div id="user-pill">
+      <div class="user-avatar" id="user-initials">?</div>
+      <span class="user-email" id="user-email-label"></span>
+      <button class="signout-btn" onclick="signOut()" title="Sign out">✕</button>
+    </div>
+  </div>
+</header>
+
+<div class="app">
+
+  <!-- LEFT: Rule Input -->
+  <div class="panel-left">
+    <div class="panel-header">📋 YARA-L Rule</div>
+    <textarea id="rule-input" class="rule-textarea" placeholder="Paste your YARA-L rule here...
+
+rule detect_lateral_movement {
+  meta:
+    description = &quot;Detects lateral movement via SMB&quot;
+  events:
+    $e.metadata.event_type = &quot;NETWORK_CONNECTION&quot;
+    $e.network.application_protocol = &quot;SMB&quot;
+    $e.principal.user.userid != &quot;SYSTEM&quot;
+  condition:
+    $e
+}"></textarea>
+    <div class="action-bar">
+      <div class="rule-name-row">
+        <input id="rule-name-input" class="rule-name-input" placeholder="Rule name (optional)" />
+      </div>
+      <div class="btn-row">
+        <button class="btn full" onclick="runAnalyze()">🔍 Analyze Rule</button>
+        <button class="btn" onclick="runGenerate()" title="Generate Synthetic Events">⚡ Events</button>
+      </div>
+      <button class="btn full" style="border-color:var(--accent3);color:var(--accent3)" onclick="runIngest()">📤 Ingest Synthetic Events</button>
+      <button class="btn primary full" onclick="runFullValidation()">🚀 Full Validation Pipeline</button>
+      <hr class="section-divider"/>
+      <button class="btn full" style="border-color:var(--warn);color:var(--warn)" onclick="showVerifyPanel()">✅ Verify Rule Fired</button>
+      <button class="btn full" style="border-color:var(--danger);color:var(--danger)" onclick="clearAll()">🗑 Clear &amp; Start Over</button>
+    </div>
+  </div>
+
+  <!-- MIDDLE: Results -->
+  <div class="panel-mid">
+    <div class="panel-header">📊 Results &amp; Pipeline</div>
+    <div id="pipeline-sticky"></div>
+    <div class="results-area" id="results-area">
+      <div class="empty-state" id="empty-state">
+        <div class="icon">🔬</div>
+        <p>Paste a YARA-L rule and click <strong>Analyze</strong> or <strong>Full Validation Pipeline</strong></p>
+        <p style="font-size:0.75rem">The pipeline will: analyze → generate UDM events → ingest → verify</p>
+      </div>
+    </div>
+  </div>
+
+  <!-- RIGHT: Chat -->
+  <div class="panel-right">
+    <div class="panel-header">💬 AI Assistant</div>
+    <div class="chat-msgs" id="chat-msgs">
+      <div class="msg assistant">
+        <div class="msg-avatar">🔬</div>
+        <div class="msg-bubble">Hello! I can help you validate YARA-L detection rules. Paste a rule and ask me to analyze it, generate test events, or run the full validation pipeline.</div>
+      </div>
+    </div>
+    <div class="chat-input-area">
+      <textarea id="chat-input" class="chat-input" rows="1" placeholder="Ask about your rule..." onkeydown="chatKeydown(event)"></textarea>
+      <button class="chat-send-btn" id="chat-send-btn" onclick="sendChat()">▶</button>
+    </div>
+  </div>
+
+</div>
+
+<script>
+// ── AUTH ─────────────────────────────────────────────────────────
+let authToken = null;
+let tokenExpiry = 0;
+let sessionId = null;
+let lastAnalysis = null;
+
+function getAuthHeaders() {
+  if (authToken && Date.now() < tokenExpiry) {
+    return {'Authorization': 'Bearer ' + authToken};
+  }
+  return {};
+}
+
+function showLoginOverlay() {
+  document.getElementById('login-overlay').classList.add('visible');
+}
+function hideLoginOverlay() {
+  document.getElementById('login-overlay').classList.remove('visible');
+}
+
+function handleCredentialResponse(response) {
+  const token = response.credential;
+  const payload = JSON.parse(atob(token.split('.')[1]));
+  authToken = token;
+  tokenExpiry = payload.exp * 1000;
+  sessionStorage.setItem('yv_token', token);
+  sessionStorage.setItem('yv_expiry', tokenExpiry);
+  hideLoginOverlay();
+  showUserPill(payload.email);
+}
+
+function showUserPill(email) {
+  const pill = document.getElementById('user-pill');
+  pill.classList.add('visible');
+  document.getElementById('user-email-label').textContent = email;
+  const initials = email.split('@')[0].slice(0, 2).toUpperCase();
+  document.getElementById('user-initials').textContent = initials;
+}
+
+function signOut() {
+  authToken = null; tokenExpiry = 0;
+  sessionStorage.removeItem('yv_token');
+  sessionStorage.removeItem('yv_expiry');
+  document.getElementById('user-pill').classList.remove('visible');
+  showLoginOverlay();
+}
+
+async function bootAuth() {
+  const resp = await fetch('/api/auth-config').then(r => r.json()).catch(() => ({auth_required: false}));
+  if (!resp.auth_required) { return; }
+
+  const saved = sessionStorage.getItem('yv_token');
+  const exp = parseInt(sessionStorage.getItem('yv_expiry') || '0');
+  if (saved && Date.now() < exp - 60000) {
+    authToken = saved; tokenExpiry = exp;
+    const payload = JSON.parse(atob(saved.split('.')[1]));
+    showUserPill(payload.email);
+    return;
+  }
+
+  showLoginOverlay();
+  google.accounts.id.initialize({
+    client_id: resp.client_id,
+    callback: handleCredentialResponse,
+    auto_select: true
+  });
+  google.accounts.id.renderButton(document.getElementById('google-signin-btn'), {
+    theme: 'outline', size: 'large', width: 300, text: 'signin_with'
+  });
+  google.accounts.id.prompt();
+}
+
+// ── HELPERS ──────────────────────────────────────────────────────
+function clearEmpty() {
+  document.getElementById('empty-state').style.display = 'none';
+}
+
+function addCard(title, body, badgeText, badgeClass) {
+  clearEmpty();
+  const area = document.getElementById('results-area');
+  const card = document.createElement('div');
+  card.className = 'result-card';
+  const collapsed = false;
+  card.innerHTML = `
+    <div class="result-card-header" onclick="toggleCard(this)">
+      <h3>${title}</h3>
+      <div style="display:flex;gap:8px;align-items:center">
+        <span class="badge ${badgeClass || ''}">${badgeText || ''}</span>
+        <span class="collapse-toggle">▼</span>
+      </div>
+    </div>
+    <div class="result-card-body"><pre>${escHtml(body)}</pre></div>`;
+  area.appendChild(card);
+  card.scrollIntoView({behavior: 'smooth', block: 'end'});
+  return card;
+}
+
+function toggleCard(header) {
+  const body = header.nextElementSibling;
+  const toggle = header.querySelector('.collapse-toggle');
+  if (body.style.display === 'none') {
+    body.style.display = '';
+    toggle.textContent = '▼';
+  } else {
+    body.style.display = 'none';
+    toggle.textContent = '▶';
+  }
+}
+
+function escHtml(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+function addPipeline(step) {
+  clearEmpty();
+  const steps = ['Analyze', 'Gen Events', 'Ingest', 'Verify'];
+  const sticky = document.getElementById('pipeline-sticky');
+  let pipe = document.getElementById('pipeline-card');
+  if (!pipe) {
+    pipe = document.createElement('div');
+    pipe.id = 'pipeline-card';
+    pipe.className = 'result-card';
+    pipe.innerHTML = `
+      <div class="result-card-header"><h3>🔄 Validation Pipeline</h3><span class="badge info">RUNNING</span></div>
+      <div class="result-card-body">
+        <div class="pipeline" id="pipeline-steps">
+          ${steps.map((s,i) => `<div class="pipe-step pending" id="pipe-${i}"><span class="step-label">${s}</span></div>`).join('')}
+        </div>
+        <div class="progress-bar"><div class="progress-fill" id="progress-fill" style="width:0%"></div></div>
+        <div id="pipeline-status" style="font-size:0.75rem;color:var(--muted);margin-top:4px"></div>
+      </div>`;
+    sticky.innerHTML = '';
+    sticky.appendChild(pipe);
+  }
+  const idx = steps.indexOf(step);
+  steps.forEach((_,i) => {
+    const el = document.getElementById(`pipe-${i}`);
+    if (i < idx) el.className = 'pipe-step done';
+    else if (i === idx) el.className = 'pipe-step active';
+    else el.className = 'pipe-step pending';
+  });
+  document.getElementById('progress-fill').style.width = ((idx+1)/steps.length*100) + '%';
+  document.getElementById('pipeline-status').textContent = `▶ ${step}...`;
+}
+
+function finishPipeline(status, msg) {
+  const pipe = document.getElementById('pipeline-card');
+  if (!pipe) return;
+  const badge = pipe.querySelector('.badge');
+  if (status === 'ok') { badge.textContent = 'DONE'; badge.className = 'badge ok'; }
+  else if (status === 'warn') { badge.textContent = 'AWAITING'; badge.className = 'badge warn'; }
+  else { badge.textContent = 'ERROR'; badge.className = 'badge err'; }
+  document.getElementById('pipeline-status').textContent = msg || '';
+  document.getElementById('progress-fill').style.width = '100%';
+  ['pipe-0','pipe-1','pipe-2','pipe-3'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.className = 'pipe-step done';
+  });
+}
+
+async function runIngest() {
+  if (!lastAnalysis) { alert('Run Analyze + Gen Events first.'); return; }
+  const lastEventsCard = [...document.querySelectorAll('.result-card')]
+    .find(c => c.querySelector('h3')?.textContent.includes('Synthetic Events'));
+  if (!lastEventsCard) { alert('Generate events first with ⚡ Events button.'); return; }
+  const preText = lastEventsCard.querySelector('pre')?.textContent || '';
+  let eventsJson;
+  try { eventsJson = JSON.parse(preText); } catch { alert('Could not read generated events.'); return; }
+  addCard('📤 Ingesting...', 'Sending events to Chronicle...', 'WORKING', 'info');
+  try {
+    const data = await callApi('/api/ingest', {events_json: JSON.stringify(eventsJson)});
+    const cards = document.querySelectorAll('.result-card:not(#pipeline-card)');
+    cards[cards.length - 1].remove();
+    if (data.error) {
+      addCard('📤 Ingestion — Error', data.error, 'ERROR', 'err');
+    } else {
+      addCard('📤 Ingestion', JSON.stringify(data, null, 2), 'DONE', 'ok');
+      const rn = document.getElementById('rule-name-input').value.trim() || (lastAnalysis && lastAnalysis.rule_name) || '';
+      showVerifyCard(rn, data.validation_id || '');
+    }
+  } catch(e) {
+    if (e.message !== 'Unauthorized') addCard('Error', e.message, 'ERROR', 'err');
+  }
+}
+
+// ── TOOL CALLS ───────────────────────────────────────────────────
+async function callApi(path, body) {
+  const resp = await fetch(path, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json', ...getAuthHeaders()},
+    body: JSON.stringify(body)
+  });
+  if (resp.status === 401) { showLoginOverlay(); throw new Error('Unauthorized'); }
+  return resp.json();
+}
+
+async function runAnalyze() {
+  const rule = document.getElementById('rule-input').value.trim();
+  if (!rule) { alert('Paste a YARA-L rule first.'); return; }
+  addCard('🔍 Analyzing rule...', 'Please wait...', 'WORKING', 'info');
+  try {
+    const data = await callApi('/api/analyze', {rule: rule});
+    const cards = document.querySelectorAll('.result-card');
+    cards[cards.length - 1].remove();
+    if (data.error) {
+      addCard('🔍 Analysis — Error', data.error, 'ERROR', 'err');
+    } else {
+      lastAnalysis = data;
+      addCard('🔍 Rule Analysis', JSON.stringify(lastAnalysis, null, 2), 'DONE', 'ok');
+      const name = lastAnalysis.rule_name || '';
+      if (name && !document.getElementById('rule-name-input').value) {
+        document.getElementById('rule-name-input').value = name;
+      }
+    }
+  } catch(e) {
+    if (e.message !== 'Unauthorized') addCard('Error', e.message, 'ERROR', 'err');
+  }
+}
+
+async function runGenerate() {
+  if (!lastAnalysis) { alert('Run Analysis first.'); return; }
+  addCard('⚡ Generating synthetic events...', 'Please wait...', 'WORKING', 'info');
+  try {
+    const data = await callApi('/api/generate', {
+      analysis_json: JSON.stringify(lastAnalysis),
+      count: 5
+    });
+    const cards = document.querySelectorAll('.result-card');
+    cards[cards.length - 1].remove();
+    if (data.error) {
+      addCard('⚡ Gen Events — Error', data.error, 'ERROR', 'err');
+    } else {
+      addCard('⚡ Synthetic Events', JSON.stringify(data, null, 2), 'DONE', 'ok');
+    }
+  } catch(e) {
+    if (e.message !== 'Unauthorized') addCard('Error', e.message, 'ERROR', 'err');
+  }
+}
+
+function clearAll() {
+  document.getElementById('rule-input').value = '';
+  document.getElementById('rule-name-input').value = '';
+  document.getElementById('pipeline-sticky').innerHTML = '';
+  const area = document.getElementById('results-area');
+  area.innerHTML = '';
+  const empty = document.createElement('div');
+  empty.id = 'empty-state';
+  empty.className = 'empty-state';
+  empty.innerHTML = '<div class="icon">🔬</div><p>Paste a YARA-L rule and click <strong>Analyze</strong> or <strong>Full Validation Pipeline</strong></p><p style="font-size:0.75rem">The pipeline will: analyze → generate UDM events → ingest → verify</p>';
+  area.appendChild(empty);
+  lastAnalysis = null;
+  sessionId = crypto.randomUUID();
+}
+
+function tick() { return new Promise(r => setTimeout(r, 0)); }
+
+async function runFullValidation() {
+  const rule = document.getElementById('rule-input').value.trim();
+  if (!rule) { alert('Paste a YARA-L rule first.'); return; }
+  const ruleName = document.getElementById('rule-name-input').value.trim();
+
+  const old = document.getElementById('pipeline-card');
+  if (old) old.remove();
+  if (!sessionId) sessionId = crypto.randomUUID();
+
+  // ── Step 1: Analyze ──────────────────────────────────────────
+  addPipeline('Analyze');
+  await tick();   // let browser paint the "Analyze" active state
+  let analyzeData;
+  try {
+    analyzeData = await callApi('/api/analyze', {rule});
+  } catch(e) {
+    if (e.message !== 'Unauthorized') finishPipeline('err', 'Analyze failed: ' + e.message);
+    return;
+  }
+  if (analyzeData.error) { finishPipeline('err', analyzeData.error); return; }
+  lastAnalysis = analyzeData;
+  addCard('🔍 Rule Analysis', JSON.stringify(lastAnalysis, null, 2), 'DONE', 'ok');
+  if (!document.getElementById('rule-name-input').value && lastAnalysis.rule_name) {
+    document.getElementById('rule-name-input').value = lastAnalysis.rule_name;
+  }
+
+  // ── Step 2: Generate Events ──────────────────────────────────
+  addPipeline('Gen Events');
+  await tick();
+  let genData;
+  try {
+    genData = await callApi('/api/generate', {analysis_json: JSON.stringify(lastAnalysis), count: 5});
+  } catch(e) {
+    if (e.message !== 'Unauthorized') finishPipeline('err', 'Generate failed: ' + e.message);
+    return;
+  }
+  if (genData.error) { finishPipeline('err', genData.error); return; }
+  addCard('⚡ Synthetic Events (' + (genData.count || (genData.events || []).length || 5) + ')',
+          JSON.stringify(genData, null, 2), 'DONE', 'ok');
+
+  // ── Step 3: Ingest ───────────────────────────────────────────
+  addPipeline('Ingest');
+  await tick();
+  let ingestData;
+  try {
+    ingestData = await callApi('/api/ingest', {events_json: JSON.stringify(genData)});
+  } catch(e) {
+    if (e.message !== 'Unauthorized') finishPipeline('err', 'Ingest failed: ' + e.message);
+    return;
+  }
+  if (ingestData.error) { finishPipeline('err', ingestData.error); return; }
+  addCard('📤 Ingestion', JSON.stringify(ingestData, null, 2), 'DONE', 'ok');
+
+  const validationId = ingestData.validation_id || '';
+  const effectiveRuleName = ruleName || lastAnalysis.rule_name || '';
+  finishPipeline('warn', 'Events ingested — Chronicle evaluates rules every ~2-5 min');
+  showVerifyCard(effectiveRuleName, validationId);
+}
+
+function showVerifyCard(ruleName, validationId) {
+  const area = document.getElementById('results-area');
+  const card = document.createElement('div');
+  card.className = 'result-card';
+  card.innerHTML = `
+    <div class="result-card-header"><h3>✅ Verify Rule Fired</h3><span class="badge warn">WAITING</span></div>
+    <div class="result-card-body">
+      <div class="verify-countdown">
+        ⏱ Chronicle needs ~2-5 minutes to evaluate the rule after ingestion.<br/>
+        Click <strong>Verify Now</strong> after waiting, or set a countdown.
+        <div class="verify-btn-row">
+          <button class="btn" onclick="doVerify('${escHtml(ruleName)}','${escHtml(validationId)}',this.closest('.result-card'))">✅ Verify Now</button>
+          <input id="verify-rule-name" class="rule-name-input" style="flex:1" placeholder="Rule name" value="${escHtml(ruleName)}"/>
+        </div>
+      </div>
+    </div>`;
+  area.appendChild(card);
+  card.scrollIntoView({behavior: 'smooth', block: 'end'});
+}
+
+function showVerifyPanel() {
+  const ruleName = document.getElementById('rule-name-input').value.trim();
+  showVerifyCard(ruleName, '');
+}
+
+async function doVerify(ruleName, validationId, card) {
+  const nameInput = card.querySelector('#verify-rule-name');
+  const effective = (nameInput && nameInput.value.trim()) || ruleName;
+  if (!effective) { alert('Enter a rule name to verify.'); return; }
+  const badge = card.querySelector('.badge');
+  badge.textContent = 'CHECKING'; badge.className = 'badge info';
+  try {
+    const data = await callApi('/api/verify', {rule_name: effective, validation_id: validationId, minutes_back: 15});
+    const pre = card.querySelector('.verify-countdown');
+    pre.innerHTML = `<pre style="white-space:pre-wrap">${escHtml(JSON.stringify(data, null, 2))}</pre>`;
+    const triggered = data.triggered || (data.detection_count > 0);
+    badge.textContent = triggered ? 'FIRED ✓' : 'NO DETECTIONS';
+    badge.className = triggered ? 'badge ok' : 'badge warn';
+  } catch(e) {
+    if (e.message !== 'Unauthorized') { badge.textContent = 'ERROR'; badge.className = 'badge err'; }
+  }
+}
+
+// ── CHAT ─────────────────────────────────────────────────────────
+function appendMsg(role, text) {
+  const msgs = document.getElementById('chat-msgs');
+  const div = document.createElement('div');
+  div.className = 'msg ' + role;
+  const avatarChar = role === 'user' ? 'U' : '🔬';
+  div.innerHTML = `<div class="msg-avatar">${avatarChar}</div><div class="msg-bubble">${escHtml(text)}</div>`;
+  msgs.appendChild(div);
+  msgs.scrollTop = msgs.scrollHeight;
+}
+
+function showTyping() {
+  const msgs = document.getElementById('chat-msgs');
+  const div = document.createElement('div');
+  div.className = 'msg assistant'; div.id = 'typing-indicator';
+  div.innerHTML = '<div class="msg-avatar">🔬</div><div class="msg-bubble"><div class="typing"><span></span><span></span><span></span></div></div>';
+  msgs.appendChild(div);
+  msgs.scrollTop = msgs.scrollHeight;
+}
+
+function removeTyping() {
+  const el = document.getElementById('typing-indicator');
+  if (el) el.remove();
+}
+
+async function sendChat() {
+  const input = document.getElementById('chat-input');
+  const msg = input.value.trim();
+  if (!msg) return;
+  input.value = '';
+  input.style.height = 'auto';
+  appendMsg('user', msg);
+  showTyping();
+  document.getElementById('chat-send-btn').disabled = true;
+
+  if (!sessionId) sessionId = crypto.randomUUID();
+
+  try {
+    const data = await callApi('/api/chat', {
+      message: msg,
+      session_id: sessionId,
+      context: {
+        current_rule: document.getElementById('rule-input').value.trim(),
+        last_analysis: lastAnalysis
+      }
+    });
+    removeTyping();
+    appendMsg('assistant', data.response || data.error || 'No response');
+  } catch(e) {
+    removeTyping();
+    if (e.message !== 'Unauthorized') appendMsg('assistant', 'Error: ' + e.message);
+  }
+  document.getElementById('chat-send-btn').disabled = false;
+}
+
+function chatKeydown(e) {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendChat(); }
+}
+
+// Auto-resize chat textarea
+document.getElementById('chat-input').addEventListener('input', function() {
+  this.style.height = 'auto';
+  this.style.height = Math.min(this.scrollHeight, 100) + 'px';
+});
+
+// ── BOOT ─────────────────────────────────────────────────────────
+bootAuth();
+</script>
+</body>
+</html>
