@@ -202,6 +202,10 @@ def analyze_yara_l_rule(rule_text: str) -> str:
 - time_window: string or null
 - trigger_summary: string (max 300 chars, single line)
 - synthetic_event_hints: object with key=variable name, value=object of field:value pairs to use
+- min_event_count: integer — the MINIMUM total number of events required to satisfy the condition block.
+  For rules with count conditions like "#fail >= 5 and #success >= 1", this is 5+1=6.
+  For simple single-event rules this is 1. Always set this accurately.
+- event_breakdown: object mapping each event variable to the minimum count needed, e.g. {{"$fail": 5, "$success": 1}}
 
 Keep ALL string values on a single line. No literal newlines inside strings. Escape backslashes.
 For complex rules with many event variables, focus on the MINIMUM subset needed to trigger the rule.
@@ -231,10 +235,23 @@ def generate_synthetic_events(analysis_json: str, count: int = 5) -> str:
     except Exception:
         analysis = {"trigger_summary": analysis_json}
 
-    prompt = f"""Generate exactly {count} synthetic UDM events in JSON format to trigger this YARA-L rule.
+    # Honour min_event_count from analysis — rules like "#fail >= 5 and #success >= 1"
+    # need at least 6 events; never generate fewer than what the condition requires.
+    min_needed = analysis.get("min_event_count", count)
+    actual_count = max(count, min_needed)
+    breakdown = analysis.get("event_breakdown", {})
+    breakdown_note = (
+        f"Event breakdown required: {json.dumps(breakdown)} — "
+        f"you MUST generate at least this many events of each type."
+        if breakdown else ""
+    )
+
+    prompt = f"""Generate exactly {actual_count} synthetic UDM events in JSON format to trigger this YARA-L rule.
 
 Rule analysis:
 {json.dumps(analysis, indent=2)}
+
+{breakdown_note}
 
 UDM field reference:
 - metadata.event_type: e.g. "NETWORK_CONNECTION", "PROCESS_LAUNCH", "USER_LOGIN", "FILE_CREATION", "NETWORK_DNS", "STATUS_UPDATE"
@@ -249,13 +266,19 @@ UDM field reference:
 - network.ip_protocol: "TCP", "UDP", or "ICMP"
 - network.http.method: string; network.http.response_code: integer
 - network.dns.questions: array of objects with name (string) and type (integer: 1=A, 28=AAAA)
+- security_result: array containing ONE object with:
+    action: "ALLOW" or "BLOCK" (required when the rule conditions check security_result.action)
+    severity: "LOW", "MEDIUM", "HIGH", "CRITICAL", or "INFORMATIONAL"
+    summary: string
 
 Rules:
 - Each event MUST satisfy the conditions in required_fields
 - Use fake but realistic values: IPs 10.0.0.x, hostnames WORKSTATION-01, users jsmith@test.local
-- For rules with entity joins, use consistent IPs/hostnames across events
+- For rules with entity joins (e.g. same $user or $src_ip), ALL events MUST share the exact
+  same values for those correlated fields
 - ip fields must be arrays of strings: ["10.0.0.1"]
 - port fields must be integers, not strings
+- security_result must be an ARRAY even if it contains only one object: [{{"action": "BLOCK"}}]
 
 Return ONLY a JSON array of UDM event objects. No markdown, no explanation."""
 
