@@ -436,63 +436,68 @@ def ingest_synthetic_events(events_json: str) -> str:
 
 @app_mcp.tool()
 def verify_rule_triggered(rule_name: str, minutes_back: int = 10, validation_id: str = "") -> str:
-    """Poll Chronicle detections to check if a rule fired after synthetic event ingestion.
-    rule_name: exact name of the YARA-L rule to check.
+    """Poll SecOps detections to check if a rule fired after synthetic event ingestion.
+    rule_name: exact name of the YARA-L rule (as it appears in the rule text after 'rule ').
     minutes_back: how far back to look for detections (default 10 minutes).
-    validation_id: optional — filter detections to only this test run."""
+    validation_id: optional — included in response for correlation only."""
     try:
-        token = _get_adc_token()
-        end_time = datetime.now(timezone.utc)
+        from secops import SecOpsClient
+        client = SecOpsClient().chronicle(
+            customer_id=SECOPS_CUSTOMER_ID,
+            project_id=SECOPS_PROJECT_ID,
+            region=SECOPS_REGION,
+        )
+
+        # Step 1: find the rule_id for this rule_name
+        rules = client.list_rules(view="BASIC", as_list=True)
+        rule_id = None
+        for r in rules:
+            name_field = r.get("name", "")          # e.g. ".../rules/ru_abc123"
+            display    = r.get("displayName", "")
+            rule_text  = r.get("text", "")
+            # Match on the rule name from the YARA-L text declaration or displayName
+            if (rule_name in name_field or
+                rule_name == display or
+                f"rule {rule_name}" in rule_text or
+                f"rule {rule_name} " in rule_text):
+                rule_id = name_field.split("/rules/")[-1]
+                break
+
+        if not rule_id:
+            return json.dumps({
+                "rule_name": rule_name,
+                "error": f"Rule '{rule_name}' not found in SecOps. "
+                         "Ensure the rule is deployed (enabled or disabled) in the instance.",
+                "available_rules": [r.get("name", "").split("/rules/")[-1] + " — " +
+                                    r.get("displayName", "") for r in rules[:20]],
+            })
+
+        # Step 2: list detections for that rule over the time window
+        end_time   = datetime.now(timezone.utc)
         start_time = end_time - timedelta(minutes=minutes_back)
+        result = client.list_detections(
+            rule_id=rule_id,
+            start_time=start_time,
+            end_time=end_time,
+            page_size=20,
+            as_list=True,
+        )
+        detections = result if isinstance(result, list) else result.get("detections", [])
 
-        # List detections for the rule
-        detections_url = f"{CHRONICLE_BASE}/rules/{rule_name}/detections"
-        params = {
-            "startTime": start_time.isoformat(),
-            "endTime": end_time.isoformat(),
-            "pageSize": 20,
-        }
-        resp = requests.get(detections_url, headers={"Authorization": f"Bearer {token}"}, params=params, timeout=30)
+        return json.dumps({
+            "rule_name": rule_name,
+            "rule_id": rule_id,
+            "validation_id": validation_id,
+            "detection_found": len(detections) > 0,
+            "detection_count": len(detections),
+            "time_window_minutes": minutes_back,
+            "detections": detections[:5],
+            "verdict": (
+                "PASS ✅ — Rule fired on synthetic events" if detections else
+                "PENDING ⏳ — No detections yet. SecOps may still be processing. Try again in 2-3 minutes."
+            ),
+        })
 
-        if resp.status_code == 200:
-            detections = resp.json().get("detections", [])
-            matched = detections
-            if validation_id:
-                matched = [d for d in detections if validation_id in json.dumps(d)]
-
-            return json.dumps({
-                "rule_name": rule_name,
-                "validation_id": validation_id,
-                "detection_found": len(matched) > 0,
-                "detection_count": len(matched),
-                "total_detections_in_window": len(detections),
-                "time_window_minutes": minutes_back,
-                "detections": matched[:5],
-                "verdict": "PASS ✅ — Rule fired on synthetic events" if matched else
-                           f"PENDING ⏳ — No detections yet. Chronicle may still be processing. Try again in 2 minutes." if len(detections) == 0 else
-                           "PARTIAL ⚠️ — Rule has detections but none match this validation run"
-            })
-
-        # Fallback: search via UDM detections search
-        search_url = f"{CHRONICLE_BASE}/detections:search"
-        search_body = {
-            "timeRange": {"startTime": start_time.isoformat(), "endTime": end_time.isoformat()},
-            "filter": f'rule.name = "{rule_name}"',
-            "pageSize": 10,
-        }
-        resp2 = requests.post(search_url, headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-                              json=search_body, timeout=30)
-        if resp2.status_code == 200:
-            results = resp2.json().get("detections", [])
-            return json.dumps({
-                "rule_name": rule_name,
-                "detection_found": len(results) > 0,
-                "detection_count": len(results),
-                "verdict": "PASS ✅" if results else "PENDING ⏳ — Not yet detected",
-                "detections": results[:3],
-            })
-
-        return json.dumps({"error": f"Detection check failed [{resp.status_code}]: {resp.text[:300]}"})
     except Exception as e:
         return json.dumps({"error": str(e)})
 
