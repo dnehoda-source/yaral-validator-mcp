@@ -193,7 +193,7 @@ def analyze_yara_l_rule(rule_text: str) -> str:
     """Analyze a YARA-L rule and extract what UDM events, field conditions, and entity
     relationships are needed to trigger it. Returns structured analysis with trigger requirements."""
     prompt = f"""Analyze this YARA-L rule. Return a compact JSON object with ONLY these fields:
-- rule_name: string
+- rule_name: the YARA-L declaration identifier — the exact word after "rule " in the rule text (e.g. "brute_force_success_detection"), NOT the meta.name value
 - description: string (max 200 chars, single line)
 - event_variables: array of strings (variable names only, e.g. ["$e1","$e2"])
 - required_events: array of {{variable, event_type}} objects only (no description field)
@@ -448,20 +448,25 @@ def verify_rule_triggered(rule_name: str, minutes_back: int = 10, validation_id:
             region=SECOPS_REGION,
         )
 
-        # Step 1: find the rule_id for this rule_name
-        rules = client.list_rules(view="BASIC", as_list=True)
-        rule_id = None
-        for r in rules:
-            name_field = r.get("name", "")          # e.g. ".../rules/ru_abc123"
-            display    = r.get("displayName", "")
-            rule_text  = r.get("text", "")
-            # Match on the rule name from the YARA-L text declaration or displayName
-            if (rule_name in name_field or
-                rule_name == display or
-                f"rule {rule_name}" in rule_text or
-                f"rule {rule_name} " in rule_text):
-                rule_id = name_field.split("/rules/")[-1]
-                break
+        # Step 1: find the rule_id for this rule_name.
+        # rule_name may be the YARA-L declaration identifier OR the ru_xxx ID directly.
+        if rule_name.startswith("ru_"):
+            rule_id = rule_name
+        else:
+            rules = client.list_rules(view="FULL", as_list=True)
+            rule_id = None
+            needle = rule_name.lower().strip()
+            for r in rules:
+                res_name  = r.get("name", "")
+                display   = r.get("displayName", "").lower()
+                rule_text = r.get("text", "")
+                ru_id     = res_name.split("/rules/")[-1]
+                if (needle == display or
+                        needle == ru_id or
+                        f"rule {needle}" in rule_text.lower() or
+                        needle in res_name.lower()):
+                    rule_id = ru_id
+                    break
 
         if not rule_id:
             return json.dumps({
