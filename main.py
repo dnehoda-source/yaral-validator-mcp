@@ -228,66 +228,64 @@ Return ONLY valid compact JSON, no markdown, no explanation."""
 
 @app_mcp.tool()
 def generate_synthetic_events(analysis_json: str, count: int = 5) -> str:
-    """Given the output of analyze_yara_l_rule, generate synthetic UDM events that will
-    trigger the rule. Returns events as JSON strings ready for ingest_log(log_type='UDM')."""
+    """Given the output of analyze_yara_l_rule, generate synthetic native-format security logs
+    that will trigger the rule when ingested. Returns {log_type, logs, count}."""
     try:
         analysis = json.loads(analysis_json) if isinstance(analysis_json, str) else analysis_json
     except Exception:
         analysis = {"trigger_summary": analysis_json}
 
-    # Honour min_event_count from analysis — rules like "#fail >= 5 and #success >= 1"
-    # need at least 6 events; never generate fewer than what the condition requires.
-    min_needed = analysis.get("min_event_count", count)
+    min_needed  = analysis.get("min_event_count", count)
     actual_count = max(count, min_needed)
-    breakdown = analysis.get("event_breakdown", {})
-    breakdown_note = (
-        f"Event breakdown required: {json.dumps(breakdown)} — "
-        f"you MUST generate at least this many events of each type."
-        if breakdown else ""
-    )
+    breakdown   = analysis.get("event_breakdown", {})
 
-    prompt = f"""Generate exactly {actual_count} synthetic UDM events in JSON format to trigger this YARA-L rule.
+    # Current timestamps spread across a 9-minute window so LIVE rules evaluate them
+    now = datetime.now(timezone.utc)
+    timestamps = [
+        (now + timedelta(minutes=i)).strftime('%Y-%m-%dT%H:%M:%S.000Z')
+        for i in range(actual_count)
+    ]
+
+    prompt = f"""Generate {actual_count} synthetic security log entries in native format to trigger this YARA-L rule.
 
 Rule analysis:
 {json.dumps(analysis, indent=2)}
 
-{breakdown_note}
+Event breakdown needed: {json.dumps(breakdown) if breakdown else "see condition block"}
+Use THESE exact timestamps (current time, so live rules evaluate them):
+{json.dumps(timestamps)}
 
-UDM field reference:
-- metadata.event_type: e.g. "NETWORK_CONNECTION", "PROCESS_LAUNCH", "USER_LOGIN", "FILE_CREATION", "NETWORK_DNS", "STATUS_UPDATE"
-- metadata.event_timestamp: RFC3339 e.g. "2025-01-15T10:30:00Z"
-- metadata.product_name: string
-- principal/target/src: ip (array of strings), hostname (string), port (integer), url (string)
-- principal/target.user.userid: string
-- principal/target.process.command_line: string
-- principal/target.process.file.full_path: string
-- network.application_protocol: e.g. "HTTP", "HTTPS", "DNS", "SSH", "SMB"
-- network.direction: "INBOUND", "OUTBOUND", or "UNKNOWN_DIRECTION"
-- network.ip_protocol: "TCP", "UDP", or "ICMP"
-- network.http.method: string; network.http.response_code: integer
-- network.dns.questions: array of objects with name (string) and type (integer: 1=A, 28=AAAA)
-- security_result: array containing ONE object with:
-    action: "ALLOW" or "BLOCK" (required when the rule conditions check security_result.action)
-    severity: "LOW", "MEDIUM", "HIGH", "CRITICAL", or "INFORMATIONAL"
-    summary: string
+STEP 1 — choose the best log type:
+- OKTA  → USER_LOGIN, auth events; maps: client.ipAddress→principal.ip, target[].alternateId→target.user.userid, outcome.result SUCCESS/FAILURE→security_result.action ALLOW/BLOCK
+- WINEVTLOG → PROCESS_LAUNCH (EventID 4688), USER_LOGIN (EventID 4624/4625); maps: SubjectUserName→principal.user.userid, NewProcessName→target.process.file.full_path, IpAddress→principal.ip
+- PAN_NGFW → NETWORK_CONNECTION/TRAFFIC; maps: src/dst IP, dst port, application
+- NGINX  → NETWORK_HTTP; maps: client IP→principal.ip, method, status, URI→target.url
 
-Rules:
-- Each event MUST satisfy the conditions in required_fields
-- Use fake but realistic values: IPs 10.0.0.x, hostnames WORKSTATION-01, users jsmith@test.local
-- For rules with entity joins (e.g. same $user or $src_ip), ALL events MUST share the exact
-  same values for those correlated fields
-- ip fields must be arrays of strings: ["10.0.0.1"]
-- port fields must be integers, not strings
-- security_result must be an ARRAY even if it contains only one object: [{{"action": "BLOCK"}}]
+STEP 2 — generate exactly {actual_count} log entries in that format, satisfying ALL required_fields.
+For correlated rules (same $user, $src_ip, etc.) use identical values across all logs.
+Use fake realistic values: IPs 10.0.0.x, users jsmith@corp.local, hosts WKSTN-01.
 
-Return ONLY a JSON array of UDM event objects. No markdown, no explanation."""
+STEP 3 — return ONLY this JSON, no markdown:
+{{
+  "log_type": "CHOSEN_TYPE",
+  "logs": ["complete log string 1", "complete log string 2", ...]
+}}
+
+OKTA log example (for USER_LOGIN FAILURE):
+{{"actor":{{"alternateId":"jsmith@corp.local","type":"User"}},"client":{{"ipAddress":"10.0.0.5"}},"eventType":"user.session.start","outcome":{{"result":"FAILURE","reason":"INCORRECT_CREDENTIALS"}},"target":[{{"alternateId":"jsmith@corp.local","type":"User"}}],"published":"TIMESTAMP"}}
+
+OKTA log example (for USER_LOGIN SUCCESS):
+{{"actor":{{"alternateId":"jsmith@corp.local","type":"User"}},"client":{{"ipAddress":"10.0.0.5"}},"eventType":"user.session.start","outcome":{{"result":"SUCCESS"}},"target":[{{"alternateId":"jsmith@corp.local","type":"User"}}],"published":"TIMESTAMP"}}"""
 
     try:
         result = _gemini(prompt, max_tokens=8192)
-        events = _extract_json(result)
-        if not isinstance(events, list):
-            events = [events]
-        return json.dumps({"events": events, "count": len(events)})
+        parsed = _extract_json(result)
+        if isinstance(parsed, dict) and "logs" in parsed:
+            log_type = parsed.get("log_type", "OKTA")
+            logs = parsed["logs"] if isinstance(parsed["logs"], list) else [parsed["logs"]]
+            return json.dumps({"log_type": log_type, "logs": logs, "count": len(logs)})
+        # Fallback: Gemini returned a raw array — shouldn't happen but handle gracefully
+        return json.dumps({"error": f"Generator returned unexpected format: {result[:200]}"})
     except Exception as ex:
         return json.dumps({"error": str(ex)})
 
@@ -424,34 +422,29 @@ def ingest_synthetic_events(events_json: str) -> str:
         validation_id = f"yaral-test-{uuid.uuid4().hex[:12]}"
         ingestion_time = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
 
-        # Accept {events: [...]} from generate_synthetic_events
-        if isinstance(data, dict) and "events" in data:
-            events = data["events"]
-        elif isinstance(data, list):
-            events = data
-        else:
-            return json.dumps({"error": "Expected {events: [...]} from generate_synthetic_events"})
+        # Native log format from generate_synthetic_events: {log_type, logs}
+        if isinstance(data, dict) and "log_type" in data and "logs" in data:
+            log_type = data["log_type"]
+            logs = data["logs"]
+            if not isinstance(logs, list):
+                logs = [logs]
+            logger.info(f"Ingesting {len(logs)} {log_type} logs — first: {str(logs[0])[:300]}")
+            result = client.ingest_log(
+                log_type=log_type,
+                log_message=logs,
+                force_log_type=True,
+            )
+            return json.dumps({
+                "status": "ingested",
+                "validation_id": validation_id,
+                "log_type": log_type,
+                "event_count": len(logs),
+                "ingestion_time": ingestion_time,
+                "api_response": result,
+                "message": f"Ingested {len(logs)} {log_type} logs. SecOps parser creates UDM events. Wait 2-5 min then verify.",
+            })
 
-        if not isinstance(events, list) or not events:
-            return json.dumps({"error": "No events to ingest"})
-
-        # Serialize each UDM event as a JSON string — ingest_log(log_type="UDM") accepts
-        # pre-formed UDM JSON strings and bypasses the strict enum validation of ingest_udm
-        log_messages = [json.dumps(e) for e in events]
-        logger.info(f"Ingesting {len(log_messages)} UDM events via ingest_log — first: {log_messages[0][:400]}")
-        result = client.ingest_log(
-            log_type="UDM",
-            log_message=log_messages,
-            force_log_type=True,
-        )
-        return json.dumps({
-            "status": "ingested",
-            "validation_id": validation_id,
-            "event_count": len(events),
-            "ingestion_time": ingestion_time,
-            "api_response": result,
-            "message": f"Ingested {len(events)} UDM events via ingest_log. Wait 2-5 min then verify.",
-        })
+        return json.dumps({"error": "Expected {log_type, logs} output from generate_synthetic_events"})
 
     except Exception as e:
         return json.dumps({"error": str(e)})

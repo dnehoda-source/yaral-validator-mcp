@@ -206,7 +206,6 @@
 
   /* Sticky pipeline bar */
   #pipeline-sticky { border-bottom: 1px solid var(--border); background: var(--surface); }
-  #pipeline-sticky:empty { display: none; }
   #pipeline-sticky .result-card { border: none; border-radius: 0; margin: 0; }
   #pipeline-sticky .result-card-body { padding: 10px 14px 12px; }
 
@@ -284,7 +283,21 @@ rule detect_lateral_movement {
   <!-- MIDDLE: Results -->
   <div class="panel-mid">
     <div class="panel-header">📊 Results &amp; Pipeline</div>
-    <div id="pipeline-sticky"></div>
+    <div id="pipeline-sticky">
+      <div id="pipeline-card" class="result-card">
+        <div class="result-card-header"><h3>🔄 Validation Pipeline</h3><span class="badge info" id="pipeline-badge">READY</span></div>
+        <div class="result-card-body">
+          <div class="pipeline" id="pipeline-steps">
+            <div class="pipe-step pending" id="pipe-0"><span class="step-label">Analyze</span></div>
+            <div class="pipe-step pending" id="pipe-1"><span class="step-label">Gen Events</span></div>
+            <div class="pipe-step pending" id="pipe-2"><span class="step-label">Ingest</span></div>
+            <div class="pipe-step pending" id="pipe-3"><span class="step-label">Verify</span></div>
+          </div>
+          <div class="progress-bar"><div class="progress-fill" id="progress-fill" style="width:0%"></div></div>
+          <div id="pipeline-status" style="font-size:0.75rem;color:var(--muted);margin-top:4px">Paste a rule and run the pipeline</div>
+        </div>
+      </div>
+    </div>
     <div class="results-area" id="results-area">
       <div class="empty-state" id="empty-state">
         <div class="icon">🔬</div>
@@ -425,27 +438,22 @@ function escHtml(s) {
   return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }
 
+function resetPipeline() {
+  const steps = ['Analyze', 'Gen Events', 'Ingest', 'Verify'];
+  steps.forEach((_,i) => {
+    const el = document.getElementById(`pipe-${i}`);
+    if (el) el.className = 'pipe-step pending';
+  });
+  const fill = document.getElementById('progress-fill');
+  if (fill) fill.style.width = '0%';
+  const badge = document.getElementById('pipeline-badge');
+  if (badge) { badge.textContent = 'RUNNING'; badge.className = 'badge info'; }
+  document.getElementById('pipeline-status').textContent = '';
+}
+
 function addPipeline(step) {
   clearEmpty();
   const steps = ['Analyze', 'Gen Events', 'Ingest', 'Verify'];
-  const sticky = document.getElementById('pipeline-sticky');
-  let pipe = document.getElementById('pipeline-card');
-  if (!pipe) {
-    pipe = document.createElement('div');
-    pipe.id = 'pipeline-card';
-    pipe.className = 'result-card';
-    pipe.innerHTML = `
-      <div class="result-card-header"><h3>🔄 Validation Pipeline</h3><span class="badge info">RUNNING</span></div>
-      <div class="result-card-body">
-        <div class="pipeline" id="pipeline-steps">
-          ${steps.map((s,i) => `<div class="pipe-step pending" id="pipe-${i}"><span class="step-label">${s}</span></div>`).join('')}
-        </div>
-        <div class="progress-bar"><div class="progress-fill" id="progress-fill" style="width:0%"></div></div>
-        <div id="pipeline-status" style="font-size:0.75rem;color:var(--muted);margin-top:4px"></div>
-      </div>`;
-    sticky.innerHTML = '';
-    sticky.appendChild(pipe);
-  }
   const idx = steps.indexOf(step);
   steps.forEach((_,i) => {
     const el = document.getElementById(`pipe-${i}`);
@@ -554,13 +562,18 @@ async function runGenerate() {
 function clearAll() {
   document.getElementById('rule-input').value = '';
   document.getElementById('rule-name-input').value = '';
-  document.getElementById('pipeline-sticky').innerHTML = '';
+  // Reset pipeline graphic back to READY state — don't destroy it
+  const steps = ['Analyze','Gen Events','Ingest','Verify'];
+  steps.forEach((_,i) => { const el = document.getElementById(`pipe-${i}`); if(el) el.className='pipe-step pending'; });
+  const fill = document.getElementById('progress-fill'); if(fill) fill.style.width='0%';
+  const badge = document.getElementById('pipeline-badge'); if(badge){badge.textContent='READY';badge.className='badge info';}
+  document.getElementById('pipeline-status').textContent = 'Paste a rule and run the pipeline';
   const area = document.getElementById('results-area');
   area.innerHTML = '';
   const empty = document.createElement('div');
   empty.id = 'empty-state';
   empty.className = 'empty-state';
-  empty.innerHTML = '<div class="icon">🔬</div><p>Paste a YARA-L rule and click <strong>Analyze</strong> or <strong>Full Validation Pipeline</strong></p><p style="font-size:0.75rem">The pipeline will: analyze → generate UDM events → ingest → verify</p>';
+  empty.innerHTML = '<div class="icon">🔬</div><p>Paste a YARA-L rule and click <strong>Analyze</strong> or <strong>Full Validation Pipeline</strong></p><p style="font-size:0.75rem">The pipeline will: analyze → generate events → ingest → verify</p>';
   area.appendChild(empty);
   lastAnalysis = null;
   sessionId = crypto.randomUUID();
@@ -571,6 +584,7 @@ function tick() { return new Promise(r => setTimeout(r, 0)); }
 async function runFullValidation() {
   const rule = document.getElementById('rule-input').value.trim();
   if (!rule) { alert('Paste a YARA-L rule first.'); return; }
+  resetPipeline();
   const ruleName = document.getElementById('rule-name-input').value.trim();
 
   const old = document.getElementById('pipeline-card');
