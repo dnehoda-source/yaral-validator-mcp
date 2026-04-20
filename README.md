@@ -1,67 +1,113 @@
 # YARA-L Detection Validator MCP Server
 
-A detection engineering tool that validates YARA-L rules against Google SecOps by generating synthetic UDM events, ingesting them, and verifying the rule actually fires — all through a web UI or natural language chat.
+A detection engineering tool that proves YARA-L rules actually fire — and don't false-positive — by generating synthetic UDM events, ingesting them into Google SecOps, and verifying detections. No production data required.
 
 ## The Problem
 
-Google SecOps has test rule and retrohunt — both useful, but both require existing production data to run against. That works in a live environment.
+Google SecOps ships test rule and retrohunt. Both are useful. Both require production data to run against.
 
-It does not work during a SIEM migration.
+That works in a live environment. It falls apart everywhere else:
 
-When you're converting a customer from a legacy SIEM to SecOps, you have no historical events, no ingested logs, and no production data. You're configuring an entire detection layer on an empty environment with no way to verify that a converted YARA-L rule will actually fire, generate a detection, and surface a case for investigation. You find out if it works when real data starts flowing — which is also when it matters most.
+- **SIEM migrations** — You're converting rules from a legacy SIEM into a SecOps tenant with no ingested logs. No data to retrohunt against. No way to know a converted rule will fire until real traffic starts flowing, which is also when it matters most.
+- **Regression testing** — Every time you edit a shared detection library, you have no way to prove the rule you just touched still fires and still doesn't false-positive, short of waiting for production traffic.
+- **Composite detections** — Rules that chain off other rules (`rule = "stage1_brute_force"` → `stage2_lateral_movement`) are especially brittle. One broken link kills the whole chain and nobody notices until an incident slips through.
+- **False positives** — A rule that fires on the happy path can still be over-broad. Proving it doesn't fire on near-miss traffic is a separate problem nobody currently solves programmatically.
 
-That's not a testing strategy. That's a liability handed to the customer at go-live.
-
-**The gap exists because:**
-- Test rule and retrohunt require data that doesn't exist yet in a new environment
-- Manually crafting UDM events to test a rule requires deep platform knowledge and significant time per rule
-- A rule can be syntactically valid, pass a linter, and still never fire because a field mapping is wrong or a condition doesn't match how the data source actually formats events
-- There is no standard validation step in the SIEM migration workflow — rules are converted and shipped with the assumption they work
+A rule can be syntactically valid, pass a linter, and still never fire because a field mapping is wrong, a threshold is off by one, or a condition doesn't match how the data source actually formats events. There is no standard validation step in the detection lifecycle — rules are written and shipped with the assumption they work.
 
 ## What It Does
 
-This server adds a validation step to the migration workflow. You paste a converted YARA-L rule, it analyzes the exact UDM field conditions required to trigger it, generates synthetic correlated events that satisfy those conditions, ingests them into SecOps, and verifies that a detection fires and a case is created — no production data required.
+This server adds a validation layer you can run before shipping. You paste a YARA-L rule, it extracts the exact UDM conditions required to trigger it, generates synthetic correlated events that satisfy those conditions, ingests them into your SecOps instance via UDM import (no parser delay), and confirms a detection fires. Optionally, it also generates near-miss events and proves the rule **does not** fire on them.
 
-1. **Analyze** — Parses your YARA-L rule and extracts the exact UDM field conditions, event types, and entity joins required to trigger it
-2. **Generate** — Uses Gemini to synthesize realistic UDM events that satisfy those conditions
-3. **Ingest** — Sends the events into your SecOps instance via the SecOps SDK
-4. **Verify** — Confirms a detection fired and a case was created
+Five validation modes:
 
-**The migration validation workflow becomes:**
+| Mode | What it proves |
+|------|----------------|
+| **Positive** | Rule fires when the attack pattern is present |
+| **Negative** | Rule stays quiet on near-miss traffic (not over-broad) |
+| **Fixture replay** | Deterministic re-run using cached events instead of regenerating |
+| **Batch** | Pass/fail matrix across many rules in one go |
+| **Composite cascade** | Upstream rules fire → downstream composite rule fires |
+
+## The Workflow
 
 ```
-Convert rule from legacy SIEM → YARA-L
+Write / convert rule → YARA-L
          ↓
 Run through YARA-L Validator
          ↓
-Confirm detection fires and case is created
+Positive: rule fires on attack traffic
+Negative: rule stays quiet on near-miss traffic
          ↓
-Ship with confidence
+Cache as fixture → deterministic regression tests forever
+         ↓
+Ship with proof
 ```
 
-You go from "I assume this rule works" to "I have proof this rule works" — before the customer's data ever touches the environment.
+You go from "I assume this rule works" to "I have proof this rule fires on the attack pattern and does not fire on the near-miss pattern" — before the customer's data ever touches the environment.
 
 ## Architecture
 
 ```
-Browser UI ──► FastAPI Server ──► Gemini (analysis + event generation)
+Browser UI ──► FastAPI Server ──► Gemini (rule analysis + event generation)
                     │
-                    └──► Google SecOps SDK (ingest + verify)
+                    ├──► Google SecOps SDK (UDM ingest + detection polling)
+                    │
+                    └──► Fixture Store (cached events for replay)
 ```
 
-**Tools exposed (MCP):**
+UDM events are ingested via `events:import` directly — parsing is skipped entirely, so detections evaluate as soon as SecOps runs the next rule pass (usually under 60 seconds for LIVE frequency rules).
+
+## Tools (MCP)
+
+**Core validation**
 | Tool | Description |
 |------|-------------|
-| `analyze_yara_l_rule` | Extracts trigger conditions from a YARA-L rule |
-| `generate_synthetic_events` | Generates correlated UDM events that satisfy rule conditions |
-| `ingest_synthetic_events` | Ingests events into SecOps via the SecOps SDK |
-| `verify_rule_triggered` | Polls SecOps detections to confirm the rule fired |
-| `run_full_validation` | Orchestrates the full pipeline in one call |
+| `analyze_yara_l_rule` | Extracts trigger conditions, event types, and entity joins |
+| `generate_synthetic_events` | Synthesizes UDM events that satisfy the rule |
+| `ingest_synthetic_events` | Imports events into SecOps via UDM (no parser) |
+| `ensure_rule_live` | Flips the rule to LIVE so detections evaluate in near-real-time |
+| `verify_rule_triggered` | Polls detections, returns plain-English summary |
+| `run_full_validation` | Orchestrates analyze → generate → ingest → verify |
+
+**Negative / false-positive testing**
+| Tool | Description |
+|------|-------------|
+| `generate_negative_events` | Generates near-miss scenarios that should NOT trigger the rule |
+| `ingest_negative_scenario` | Ingests a single near-miss scenario |
+| `verify_rule_quiet` | Asserts no detection fired (inverse of verify) |
+
+**Fixture caching**
+| Tool | Description |
+|------|-------------|
+| `save_fixture` | Persists generated events as a named fixture |
+| `load_fixture` | Replays a fixture with refreshed timestamps |
+| `list_fixtures` | Lists all saved fixtures |
+
+**Batch**
+| Tool | Description |
+|------|-------------|
+| `batch_validate` | Runs positive (and optional negative) validation across a list of rules and returns a pass/fail matrix |
+
+**Composite detections**
+| Tool | Description |
+|------|-------------|
+| `analyze_composite_rule` | Detects rule chains (references to `.detection.` fields or base rule names) |
+| `generate_cascade_events` | Generates event sets that trigger each base rule in the chain |
+| `cascade_validate` | End-to-end: triggers base rules, waits, confirms composite fires |
+
+## Detection Summaries
+
+Detections come back as plain English instead of raw JSON:
+
+> jsmith from 10.0.0.10 failed 5 login attempts between 01:36:08 and 01:40:08 UTC, then successfully logged in at 01:41:08 UTC.
+
+You can still get raw JSON from the API for programmatic consumers.
 
 ## Prerequisites
 
 - Google Cloud project with Google SecOps enabled
-- SecOps customer ID (see below)
+- SecOps customer ID (Settings → SIEM Settings → Profile)
 - Vertex AI API enabled (for Gemini)
 - Application Default Credentials with `roles/chronicle.admin` or equivalent
 
@@ -83,10 +129,8 @@ Browser UI ──► FastAPI Server ──► Gemini (analysis + event generatio
 git clone https://github.com/dnehoda-source/yaral-validator-mcp.git
 cd yaral-validator-mcp
 
-# Build and push image
 gcloud builds submit --tag gcr.io/YOUR_PROJECT/yaral-validator:latest .
 
-# Deploy
 gcloud run deploy yaral-validator \
   --image gcr.io/YOUR_PROJECT/yaral-validator:latest \
   --region us-central1 \
@@ -97,6 +141,8 @@ gcloud run deploy yaral-validator \
   --set-env-vars "SECOPS_PROJECT_ID=YOUR_PROJECT,SECOPS_CUSTOMER_ID=YOUR_SECOPS_UUID,SECOPS_REGION=us,GEMINI_MODEL=gemini-2.5-flash"
 ```
 
+**Caveat on Cloud Run:** the fixture store writes to the container's local filesystem, which is wiped on every deploy and scale-to-zero. Fixtures survive within a warm pod's lifetime but do not persist across restarts. If you need durable fixtures, mount GCS or swap the store to Firestore.
+
 ## Run Locally
 
 ```bash
@@ -104,8 +150,6 @@ git clone https://github.com/dnehoda-source/yaral-validator-mcp.git
 cd yaral-validator-mcp
 
 pip install -r requirements.txt
-
-# Authenticate with Google
 gcloud auth application-default login
 
 export SECOPS_PROJECT_ID=your-project
@@ -115,7 +159,7 @@ export SECOPS_REGION=us
 python3 main.py
 ```
 
-Open `http://localhost:8080`
+Open `http://localhost:8080`. Fixtures persist in `./fixtures/` across restarts when running locally.
 
 ## Usage
 
@@ -124,27 +168,41 @@ Open `http://localhost:8080`
 1. Paste your YARA-L rule into the left panel
 2. Click **Analyze Rule** to extract trigger conditions
 3. Click **⚡ Events** to generate synthetic UDM traffic
-4. Click **📤 Ingest Synthetic Events** to send to SecOps
-5. Wait 2-5 minutes for SecOps to evaluate the rule
-6. Click **✅ Verify Rule Fired** to check detections
+4. Click **📤 Ingest** to send to SecOps
+5. Click **✅ Verify** to confirm the detection fired (auto-polls)
 
-Or click **🚀 Full Validation Pipeline** to run steps 1-4 automatically.
+Or click **🚀 Full Validation** to run the whole pipeline. Enable the **Negative** toggle to also run false-positive tests. Passing validations are cached as fixtures automatically.
+
+Additional buttons:
+- **🔗 Composite** — cascade validation for multi-stage rules
+- **📦 Batch** — paste a list of rules, get a pass/fail matrix
+- **📂 Fixtures** — browse saved fixtures and replay any of them
+- **💾 Save** — manually cache the current generated events
 
 ### Chat
 
-Use the right panel to interact in natural language:
-- *"Analyze this rule and tell me what events will trigger it"*
-- *"Generate 10 synthetic events for this rule"*
-- *"Check if rule detect_lateral_movement fired in the last 15 minutes"*
+Natural language in the right panel:
+
+> *"Run full validation on this rule and also check for false positives"*
+> *"Load the fixture for detect_lateral_movement and re-verify"*
+> *"Batch validate all 5 rules I just pasted"*
+
+## What It Is Not
+
+Honest scope so you don't get surprised:
+
+- **Not a rule linter.** Syntax and style are out of scope — use Google's built-in rule editor for that.
+- **Not a replacement for production telemetry.** Synthetic events prove the rule *can* fire on the pattern you described. Real data can still surface corner cases the synthetic generator didn't think of.
+- **Not deterministic by default.** Gemini generation varies run-to-run; use fixture caching to lock an event set for regression tests.
+- **Negative testing is bounded by imagination.** The tool generates five perturbation axes (threshold, entity, time window, action, missing event type). It won't catch every false-positive class — only the ones it knows how to perturb.
 
 ## Security
 
-- Security headers on all responses (CSP, HSTS, X-Frame-Options, etc.)
+- Security headers on all responses (CSP, HSTS, X-Frame-Options)
 - Optional Google OAuth — set `OAUTH_CLIENT_ID` to require login
 - No credentials stored in code — uses Application Default Credentials
+- Fixtures are stored locally on the server — do not commit real customer event data into a public fixtures directory
 
 ## Finding Your SecOps Customer ID
 
-In the SecOps UI: **Settings → SIEM Settings → Profile**
-
-Your customer ID is listed there as a UUID (e.g. `1d49deb2-eaa7-427c-a1d1-e78ccaa91c10`).
+In the SecOps UI: **Settings → SIEM Settings → Profile**. Customer ID is a UUID (e.g. `1d49deb2-eaa7-427c-a1d1-e78ccaa91c10`).

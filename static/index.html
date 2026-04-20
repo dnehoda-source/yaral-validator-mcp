@@ -274,7 +274,19 @@ rule detect_lateral_movement {
       </div>
       <button class="btn full" style="border-color:var(--accent3);color:var(--accent3)" onclick="runIngest()">📤 Ingest Synthetic Events</button>
       <button class="btn primary full" onclick="runFullValidation()">🚀 Full Validation Pipeline</button>
+      <label style="display:flex;align-items:center;gap:6px;font-size:0.75rem;color:var(--muted);padding:0 4px">
+        <input type="checkbox" id="run-negative-toggle"/>
+        Also run negative tests (false-positive check)
+      </label>
       <hr class="section-divider"/>
+      <div class="btn-row">
+        <button class="btn" onclick="runCascadeValidation()" title="Composite / chained detection">🔗 Composite</button>
+        <button class="btn" onclick="openBatchPanel()" title="Validate many rules at once">📦 Batch</button>
+      </div>
+      <div class="btn-row">
+        <button class="btn" onclick="openFixtureList()" title="Replay a saved fixture">📂 Fixtures</button>
+        <button class="btn" onclick="saveCurrentAsFixture()" title="Save last successful events">💾 Save</button>
+      </div>
       <button class="btn full" style="border-color:var(--warn);color:var(--warn)" onclick="showVerifyPanel()">✅ Verify Rule Fired</button>
       <button class="btn full" style="border-color:var(--danger);color:var(--danger)" onclick="clearAll()">🗑 Clear &amp; Start Over</button>
     </div>
@@ -289,9 +301,10 @@ rule detect_lateral_movement {
         <div class="result-card-body">
           <div class="pipeline" id="pipeline-steps">
             <div class="pipe-step pending" id="pipe-0"><span class="step-label">Analyze</span></div>
-            <div class="pipe-step pending" id="pipe-1"><span class="step-label">Gen Events</span></div>
-            <div class="pipe-step pending" id="pipe-2"><span class="step-label">Ingest</span></div>
-            <div class="pipe-step pending" id="pipe-3"><span class="step-label">Verify</span></div>
+            <div class="pipe-step pending" id="pipe-1"><span class="step-label">Enable Rule</span></div>
+            <div class="pipe-step pending" id="pipe-2"><span class="step-label">Gen Events</span></div>
+            <div class="pipe-step pending" id="pipe-3"><span class="step-label">Ingest</span></div>
+            <div class="pipe-step pending" id="pipe-4"><span class="step-label">Verify</span></div>
           </div>
           <div class="progress-bar"><div class="progress-fill" id="progress-fill" style="width:0%"></div></div>
           <div id="pipeline-status" style="font-size:0.75rem;color:var(--muted);margin-top:4px">Paste a rule and run the pipeline</div>
@@ -438,9 +451,10 @@ function escHtml(s) {
   return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }
 
+const PIPE_STEPS = ['Analyze', 'Enable Rule', 'Gen Events', 'Ingest', 'Verify'];
+
 function resetPipeline() {
-  const steps = ['Analyze', 'Gen Events', 'Ingest', 'Verify'];
-  steps.forEach((_,i) => {
+  PIPE_STEPS.forEach((_,i) => {
     const el = document.getElementById(`pipe-${i}`);
     if (el) el.className = 'pipe-step pending';
   });
@@ -453,29 +467,27 @@ function resetPipeline() {
 
 function addPipeline(step) {
   clearEmpty();
-  const steps = ['Analyze', 'Gen Events', 'Ingest', 'Verify'];
-  const idx = steps.indexOf(step);
-  steps.forEach((_,i) => {
+  const idx = PIPE_STEPS.indexOf(step);
+  PIPE_STEPS.forEach((_,i) => {
     const el = document.getElementById(`pipe-${i}`);
+    if (!el) return;
     if (i < idx) el.className = 'pipe-step done';
     else if (i === idx) el.className = 'pipe-step active';
     else el.className = 'pipe-step pending';
   });
-  document.getElementById('progress-fill').style.width = ((idx+1)/steps.length*100) + '%';
+  document.getElementById('progress-fill').style.width = ((idx+1)/PIPE_STEPS.length*100) + '%';
   document.getElementById('pipeline-status').textContent = `▶ ${step}...`;
 }
 
 function finishPipeline(status, msg) {
-  const pipe = document.getElementById('pipeline-card');
-  if (!pipe) return;
-  const badge = pipe.querySelector('.badge');
-  if (status === 'ok') { badge.textContent = 'DONE'; badge.className = 'badge ok'; }
-  else if (status === 'warn') { badge.textContent = 'AWAITING'; badge.className = 'badge warn'; }
+  const badge = document.getElementById('pipeline-badge');
+  if (status === 'ok') { badge.textContent = 'PASS ✅'; badge.className = 'badge ok'; }
+  else if (status === 'warn') { badge.textContent = 'CHECKING'; badge.className = 'badge warn'; }
   else { badge.textContent = 'ERROR'; badge.className = 'badge err'; }
   document.getElementById('pipeline-status').textContent = msg || '';
   document.getElementById('progress-fill').style.width = '100%';
-  ['pipe-0','pipe-1','pipe-2','pipe-3'].forEach(id => {
-    const el = document.getElementById(id);
+  PIPE_STEPS.forEach((_,i) => {
+    const el = document.getElementById(`pipe-${i}`);
     if (el) el.className = 'pipe-step done';
   });
 }
@@ -498,7 +510,7 @@ async function runIngest() {
     } else {
       addCard('📤 Ingestion', JSON.stringify(data, null, 2), 'DONE', 'ok');
       const rn = document.getElementById('rule-name-input').value.trim() || (lastAnalysis && lastAnalysis.rule_name) || '';
-      showVerifyCard(rn, data.validation_id || '');
+      autoPollVerify(rn, data.validation_id || '');
     }
   } catch(e) {
     if (e.message !== 'Unauthorized') addCard('Error', e.message, 'ERROR', 'err');
@@ -506,12 +518,11 @@ async function runIngest() {
 }
 
 // ── TOOL CALLS ───────────────────────────────────────────────────
-async function callApi(path, body) {
-  const resp = await fetch(path, {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json', ...getAuthHeaders()},
-    body: JSON.stringify(body)
-  });
+async function callApi(path, body, method) {
+  const m = method || 'POST';
+  const opts = {method: m, headers: {'Content-Type': 'application/json', ...getAuthHeaders()}};
+  if (m !== 'GET') opts.body = JSON.stringify(body || {});
+  const resp = await fetch(path, opts);
   if (resp.status === 401) { showLoginOverlay(); throw new Error('Unauthorized'); }
   return resp.json();
 }
@@ -562,9 +573,7 @@ async function runGenerate() {
 function clearAll() {
   document.getElementById('rule-input').value = '';
   document.getElementById('rule-name-input').value = '';
-  // Reset pipeline graphic back to READY state — don't destroy it
-  const steps = ['Analyze','Gen Events','Ingest','Verify'];
-  steps.forEach((_,i) => { const el = document.getElementById(`pipe-${i}`); if(el) el.className='pipe-step pending'; });
+  PIPE_STEPS.forEach((_,i) => { const el = document.getElementById(`pipe-${i}`); if(el) el.className='pipe-step pending'; });
   const fill = document.getElementById('progress-fill'); if(fill) fill.style.width='0%';
   const badge = document.getElementById('pipeline-badge'); if(badge){badge.textContent='READY';badge.className='badge info';}
   document.getElementById('pipeline-status').textContent = 'Paste a rule and run the pipeline';
@@ -573,7 +582,7 @@ function clearAll() {
   const empty = document.createElement('div');
   empty.id = 'empty-state';
   empty.className = 'empty-state';
-  empty.innerHTML = '<div class="icon">🔬</div><p>Paste a YARA-L rule and click <strong>Analyze</strong> or <strong>Full Validation Pipeline</strong></p><p style="font-size:0.75rem">The pipeline will: analyze → generate events → ingest → verify</p>';
+  empty.innerHTML = '<div class="icon">🔬</div><p>Paste a YARA-L rule and click <strong>Analyze</strong> or <strong>Full Validation Pipeline</strong></p><p style="font-size:0.75rem">The pipeline will: analyze → enable rule → generate events → ingest → verify</p>';
   area.appendChild(empty);
   lastAnalysis = null;
   sessionId = crypto.randomUUID();
@@ -585,15 +594,11 @@ async function runFullValidation() {
   const rule = document.getElementById('rule-input').value.trim();
   if (!rule) { alert('Paste a YARA-L rule first.'); return; }
   resetPipeline();
-  const ruleName = document.getElementById('rule-name-input').value.trim();
-
-  const old = document.getElementById('pipeline-card');
-  if (old) old.remove();
   if (!sessionId) sessionId = crypto.randomUUID();
 
   // ── Step 1: Analyze ──────────────────────────────────────────
   addPipeline('Analyze');
-  await tick();   // let browser paint the "Analyze" active state
+  await tick();
   let analyzeData;
   try {
     analyzeData = await callApi('/api/analyze', {rule});
@@ -607,22 +612,57 @@ async function runFullValidation() {
   if (!document.getElementById('rule-name-input').value && lastAnalysis.rule_name) {
     document.getElementById('rule-name-input').value = lastAnalysis.rule_name;
   }
+  const effectiveRuleName = document.getElementById('rule-name-input').value.trim() || lastAnalysis.rule_name || '';
 
-  // ── Step 2: Generate Events ──────────────────────────────────
+  // ── Step 2: Enable Rule ──────────────────────────────────────
+  addPipeline('Enable Rule');
+  await tick();
+  if (effectiveRuleName) {
+    try {
+      const enableData = await callApi('/api/enable-rule', {rule_name: effectiveRuleName});
+      if (enableData.error) {
+        addCard('⚠️ Enable Rule', enableData.error, 'WARN', 'warn');
+      } else {
+        addCard('🟢 Rule Enabled', JSON.stringify(enableData, null, 2), 'DONE', 'ok');
+      }
+    } catch(e) {
+      if (e.message === 'Unauthorized') return;
+      addCard('⚠️ Enable Rule', 'Could not enable rule: ' + e.message, 'WARN', 'warn');
+    }
+  } else {
+    addCard('⚠️ Enable Rule', 'No rule name found — skipping. Enable the rule manually in SecOps before continuing.', 'WARN', 'warn');
+  }
+
+  // ── Step 3: Generate Events (try fixture first, fall back to Gemini) ─
   addPipeline('Gen Events');
   await tick();
   let genData;
-  try {
-    genData = await callApi('/api/generate', {analysis_json: JSON.stringify(lastAnalysis), count: 5});
-  } catch(e) {
-    if (e.message !== 'Unauthorized') finishPipeline('err', 'Generate failed: ' + e.message);
-    return;
+  let usedFixture = false;
+  if (effectiveRuleName) {
+    try {
+      const fx = await callApi('/api/fixture/load', {rule_name: effectiveRuleName, refresh_timestamps: true});
+      if (fx && !fx.error && fx.events && fx.events.length) {
+        genData = {events: fx.events, count: fx.event_count};
+        usedFixture = true;
+        addCard('📂 Fixture Loaded', `Replaying ${fx.event_count} saved events from fixture (no Gemini call needed).\nFixture saved: ${fx.saved_at}`, 'CACHED', 'ok');
+      }
+    } catch(e) { if (e.message === 'Unauthorized') return; }
   }
-  if (genData.error) { finishPipeline('err', genData.error); return; }
-  addCard('⚡ Synthetic Events (' + (genData.count || (genData.events || []).length || 5) + ')',
-          JSON.stringify(genData, null, 2), 'DONE', 'ok');
+  if (!usedFixture) {
+    try {
+      const minCount = lastAnalysis.min_event_count || 5;
+      genData = await callApi('/api/generate', {analysis_json: JSON.stringify(lastAnalysis), count: minCount});
+    } catch(e) {
+      if (e.message !== 'Unauthorized') finishPipeline('err', 'Generate failed: ' + e.message);
+      return;
+    }
+    if (genData.error) { finishPipeline('err', genData.error); return; }
+    addCard('⚡ Synthetic Events (' + (genData.count || (genData.events || []).length || 5) + ')',
+            JSON.stringify(genData, null, 2), 'DONE', 'ok');
+  }
+  lastGeneratedEvents = genData;
 
-  // ── Step 3: Ingest ───────────────────────────────────────────
+  // ── Step 4: Ingest ───────────────────────────────────────────
   addPipeline('Ingest');
   await tick();
   let ingestData;
@@ -635,47 +675,106 @@ async function runFullValidation() {
   if (ingestData.error) { finishPipeline('err', ingestData.error); return; }
   addCard('📤 Ingestion', JSON.stringify(ingestData, null, 2), 'DONE', 'ok');
 
-  const validationId = ingestData.validation_id || '';
-  const effectiveRuleName = ruleName || lastAnalysis.rule_name || '';
-  finishPipeline('warn', 'Events ingested — Chronicle evaluates rules every ~2-5 min');
-  showVerifyCard(effectiveRuleName, validationId);
+  // ── Step 5: Verify — auto-poll every 30s for up to 6 min ────
+  addPipeline('Verify');
+  await tick();
+  const positiveOk = await autoPollVerify(effectiveRuleName, ingestData.validation_id || '');
+
+  // ── Auto-save fixture on positive pass (only if not already from fixture) ─
+  if (positiveOk && !usedFixture && effectiveRuleName) {
+    try {
+      await callApi('/api/fixture/save', {rule_name: effectiveRuleName, events_json: JSON.stringify(genData)});
+      addCard('💾 Fixture Saved', `Auto-saved ${genData.count || (genData.events||[]).length} events as fixture for '${effectiveRuleName}'. Future runs will replay instead of regenerating.`, 'SAVED', 'ok');
+    } catch(e) { /* non-fatal */ }
+  }
+
+  // ── Optional: negative testing pass ─────────────────────────
+  const runNeg = document.getElementById('run-negative-toggle');
+  if (positiveOk && runNeg && runNeg.checked && effectiveRuleName) {
+    await runNegativeTests(lastAnalysis, effectiveRuleName);
+  }
 }
 
-function showVerifyCard(ruleName, validationId) {
+async function autoPollVerify(ruleName, validationId) {
+  const MAX_ATTEMPTS = 12;
+  const INTERVAL_MS  = 30000;
   const area = document.getElementById('results-area');
-  const card = document.createElement('div');
-  card.className = 'result-card';
-  card.innerHTML = `
-    <div class="result-card-header"><h3>✅ Verify Rule Fired</h3><span class="badge warn">WAITING</span></div>
+
+  const verifyCard = document.createElement('div');
+  verifyCard.className = 'result-card';
+  verifyCard.innerHTML = `
+    <div class="result-card-header" id="verify-card-header">
+      <h3>⏱ Verifying Rule...</h3>
+      <span class="badge warn" id="verify-badge">CHECKING</span>
+    </div>
     <div class="result-card-body">
-      <div class="verify-countdown">
-        ⏱ Chronicle needs ~2-5 minutes to evaluate the rule after ingestion.<br/>
-        Click <strong>Verify Now</strong> after waiting, or set a countdown.
-        <div class="verify-btn-row">
-          <button class="btn" onclick="doVerify('${escHtml(ruleName)}','${escHtml(validationId)}',this.closest('.result-card'))">✅ Verify Now</button>
-          <input id="verify-rule-name" class="rule-name-input" style="flex:1" placeholder="Rule name" value="${escHtml(ruleName)}"/>
-        </div>
-      </div>
+      <div id="verify-status" style="font-size:0.85rem;margin-bottom:8px">Polling for detections — checking every 30s for up to 6 minutes.</div>
+      <div class="progress-bar-wrap"><div id="verify-fill" class="progress-fill" style="background:var(--warn);width:0%"></div></div>
     </div>`;
-  area.appendChild(card);
-  card.scrollIntoView({behavior: 'smooth', block: 'end'});
+  area.appendChild(verifyCard);
+  verifyCard.scrollIntoView({behavior:'smooth', block:'end'});
+
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    const statusEl = document.getElementById('verify-status');
+    const fillEl   = document.getElementById('verify-fill');
+    if (statusEl) statusEl.textContent = `Attempt ${attempt}/${MAX_ATTEMPTS} — waiting 30s before check...`;
+
+    await new Promise(r => setTimeout(r, INTERVAL_MS));
+
+    if (statusEl) statusEl.textContent = `Attempt ${attempt}/${MAX_ATTEMPTS} — querying SecOps...`;
+    if (fillEl)   fillEl.style.width = (attempt / MAX_ATTEMPTS * 100) + '%';
+
+    try {
+      const verifyData = await callApi('/api/verify', {rule_name: ruleName, validation_id: validationId, minutes_back: 10});
+      if (verifyData.error) {
+        if (statusEl) statusEl.textContent = `Attempt ${attempt}/${MAX_ATTEMPTS} — API error: ${verifyData.error}. Retrying...`;
+        continue;
+      }
+      const triggered = verifyData.triggered || verifyData.detection_found || verifyData.status === 'triggered' || (verifyData.detection_count > 0);
+      if (triggered) {
+        const badge = document.getElementById('verify-badge');
+        if (badge) { badge.textContent = 'DETECTED ✅'; badge.className = 'badge ok'; }
+        if (statusEl) statusEl.textContent = `Detection confirmed on attempt ${attempt}. Rule fires correctly.`;
+        if (fillEl)   { fillEl.style.width = '100%'; fillEl.style.background = 'var(--accent2)'; }
+        finishPipeline('ok', 'Detection confirmed — rule fires correctly');
+        const summaryText = (verifyData.summary && verifyData.summary.length)
+          ? verifyData.summary.join('\n\n')
+          : (verifyData.verdict || 'Detection fired.');
+        addCard('✅ Detection Confirmed', summaryText, 'PASS', 'ok');
+        return true;
+      }
+      if (statusEl) statusEl.textContent = `Attempt ${attempt}/${MAX_ATTEMPTS} — no detection yet. Next check in 30s.`;
+    } catch(e) {
+      if (e.message === 'Unauthorized') return false;
+      const statusEl = document.getElementById('verify-status');
+      if (statusEl) statusEl.textContent = `Attempt ${attempt}/${MAX_ATTEMPTS} — error: ${e.message}. Retrying...`;
+    }
+  }
+
+  // Timeout after MAX_ATTEMPTS
+  const badge = document.getElementById('verify-badge');
+  if (badge) { badge.textContent = 'TIMEOUT ❌'; badge.className = 'badge err'; }
+  const statusEl = document.getElementById('verify-status');
+  if (statusEl) statusEl.textContent = 'No detection after 6 minutes. Rule may not have fired — check SecOps manually.';
+  finishPipeline('err', 'No detection after 6 minutes');
+  return false;
 }
 
 function showVerifyPanel() {
   const ruleName = document.getElementById('rule-name-input').value.trim();
-  showVerifyCard(ruleName, '');
+  if (!ruleName) { alert('Enter a rule name first.'); return; }
+  autoPollVerify(ruleName, '');
 }
 
 async function doVerify(ruleName, validationId, card) {
-  const nameInput = card.querySelector('#verify-rule-name');
-  const effective = (nameInput && nameInput.value.trim()) || ruleName;
+  const effective = ruleName;
   if (!effective) { alert('Enter a rule name to verify.'); return; }
   const badge = card.querySelector('.badge');
   badge.textContent = 'CHECKING'; badge.className = 'badge info';
   try {
     const data = await callApi('/api/verify', {rule_name: effective, validation_id: validationId, minutes_back: 15});
     const pre = card.querySelector('.verify-countdown');
-    pre.innerHTML = `<pre style="white-space:pre-wrap">${escHtml(JSON.stringify(data, null, 2))}</pre>`;
+    if (pre) pre.innerHTML = `<pre style="white-space:pre-wrap">${escHtml(JSON.stringify(data, null, 2))}</pre>`;
     const triggered = data.triggered || (data.detection_count > 0);
     badge.textContent = triggered ? 'FIRED ✓' : 'NO DETECTIONS';
     badge.className = triggered ? 'badge ok' : 'badge warn';
@@ -683,6 +782,189 @@ async function doVerify(ruleName, validationId, card) {
     if (e.message !== 'Unauthorized') { badge.textContent = 'ERROR'; badge.className = 'badge err'; }
   }
 }
+
+// ── NEGATIVE TESTING ─────────────────────────────────────────────
+async function runNegativeTests(analysis, ruleName) {
+  addCard('🧪 Negative Testing', 'Generating near-miss scenarios that should NOT fire the rule...', 'WORKING', 'info');
+  let negData;
+  try {
+    negData = await callApi('/api/generate-negative', {analysis_json: JSON.stringify(analysis), count: 3});
+  } catch(e) {
+    if (e.message === 'Unauthorized') return {ok: false};
+    addCard('🧪 Negative Testing — Error', 'Generate failed: ' + e.message, 'ERROR', 'err');
+    return {ok: false};
+  }
+  if (negData.error) {
+    addCard('🧪 Negative Testing — Error', negData.error, 'ERROR', 'err');
+    return {ok: false};
+  }
+  const scenarios = negData.scenarios || [];
+  addCard('🧪 Negative Scenarios', scenarios.map(s => `• ${s.name}: ${s.perturbation}\n  expected: ${s.expected}`).join('\n\n'), 'GENERATED', 'info');
+
+  let allPassed = true;
+  let scenarioResults = [];
+  for (const scenario of scenarios) {
+    try {
+      const ingestData = await callApi('/api/ingest-negative', {events_json: JSON.stringify({events: scenario.events})});
+      if (ingestData.error) {
+        scenarioResults.push({name: scenario.name, status: 'ingest-error', error: ingestData.error});
+        continue;
+      }
+      await new Promise(r => setTimeout(r, 60000));
+      const verifyData = await callApi('/api/verify-quiet', {rule_name: ruleName, validation_id: ingestData.validation_id, minutes_back: 3});
+      const passed = verifyData.negative_pass === true;
+      scenarioResults.push({name: scenario.name, status: passed ? 'PASS' : 'FAIL', verdict: verifyData.verdict});
+      if (!passed) allPassed = false;
+    } catch(e) {
+      if (e.message === 'Unauthorized') return {ok: false};
+      scenarioResults.push({name: scenario.name, status: 'error', error: e.message});
+    }
+  }
+  const summary = scenarioResults.map(r => `${r.status === 'PASS' ? '✅' : '❌'} ${r.name} — ${r.verdict || r.error || r.status}`).join('\n');
+  addCard(allPassed ? '✅ Negative Tests PASSED' : '❌ Negative Tests FAILED',
+          summary + (allPassed ? '\n\nRule is not over-broad — it stays quiet on near-miss events.' : '\n\nRule fired on events that should not have matched — it is too broad.'),
+          allPassed ? 'PASS' : 'FAIL', allPassed ? 'ok' : 'err');
+  return {ok: true, allPassed, results: scenarioResults};
+}
+
+
+// ── FIXTURE CACHING ──────────────────────────────────────────────
+let lastGeneratedEvents = null;
+
+async function saveCurrentAsFixture() {
+  const ruleName = (document.getElementById('rule-name-input').value.trim()) ||
+                   (lastAnalysis && lastAnalysis.rule_name) || '';
+  if (!ruleName) { alert('Run analyze first so we have a rule name to key the fixture by.'); return; }
+  if (!lastGeneratedEvents) { alert('No events to save. Run Generate or Full Validation first.'); return; }
+  try {
+    const data = await callApi('/api/fixture/save', {
+      rule_name: ruleName,
+      events_json: JSON.stringify(lastGeneratedEvents),
+    });
+    if (data.error) { addCard('💾 Fixture Save — Error', data.error, 'ERROR', 'err'); return; }
+    addCard('💾 Fixture Saved', `Rule: ${ruleName}\nEvents: ${data.event_count}\nPath: ${data.path}\n\nFuture validations can replay this fixture instead of regenerating events.`, 'SAVED', 'ok');
+  } catch(e) { if (e.message !== 'Unauthorized') addCard('Error', e.message, 'ERROR', 'err'); }
+}
+
+async function openFixtureList() {
+  try {
+    const data = await callApi('/api/fixture/list', {}, 'GET');
+    const fixtures = data.fixtures || [];
+    if (!fixtures.length) { addCard('📂 Fixtures', 'No saved fixtures yet. Run Full Validation, then click 💾 Save.', 'EMPTY', 'warn'); return; }
+    const body = fixtures.map(f => `• ${f.rule_name} — ${f.event_count} events (saved ${f.saved_at.slice(0,19)})`).join('\n');
+    addCard('📂 Saved Fixtures (' + fixtures.length + ')',
+            body + '\n\nTo replay a fixture, put its rule name in the rule-name field and click Full Validation.',
+            'LIST', 'info');
+  } catch(e) { if (e.message !== 'Unauthorized') addCard('Error', e.message, 'ERROR', 'err'); }
+}
+
+
+// ── BATCH VALIDATION ─────────────────────────────────────────────
+function openBatchPanel() {
+  const area = document.getElementById('results-area');
+  clearEmpty();
+  const card = document.createElement('div');
+  card.className = 'result-card';
+  card.innerHTML = `
+    <div class="result-card-header"><h3>📦 Batch Validation</h3><span class="badge info">PASTE RULES</span></div>
+    <div class="result-card-body">
+      <p style="font-size:0.8rem;margin-bottom:8px">Paste a JSON array: <code>[{"name":"rule_a","rule_text":"rule ..."},{"name":"rule_b","rule_text":"..."}]</code></p>
+      <textarea id="batch-input" style="width:100%;min-height:200px;background:var(--bg);color:var(--accent2);border:1px solid var(--border);border-radius:6px;padding:8px;font-family:var(--font);font-size:0.75rem" placeholder='[{"name":"...","rule_text":"..."}]'></textarea>
+      <div style="display:flex;gap:8px;align-items:center;margin-top:8px">
+        <label style="font-size:0.75rem;color:var(--muted)"><input type="checkbox" id="batch-use-fixtures" checked/> Use fixtures when available</label>
+        <label style="font-size:0.75rem;color:var(--muted)"><input type="checkbox" id="batch-run-negative"/> Run negative tests</label>
+      </div>
+      <button class="btn primary" style="margin-top:8px" onclick="runBatch()">▶ Run Batch</button>
+      <div id="batch-results" style="margin-top:12px"></div>
+    </div>`;
+  area.appendChild(card);
+  card.scrollIntoView({behavior:'smooth', block:'end'});
+}
+
+async function runBatch() {
+  const raw = document.getElementById('batch-input').value.trim();
+  if (!raw) { alert('Paste a JSON array of rules first.'); return; }
+  let parsed;
+  try { parsed = JSON.parse(raw); } catch(e) { alert('Invalid JSON: ' + e.message); return; }
+  const useFixtures = document.getElementById('batch-use-fixtures').checked;
+  const runNeg = document.getElementById('batch-run-negative').checked;
+  const resultsEl = document.getElementById('batch-results');
+  resultsEl.innerHTML = '<div style="color:var(--muted);font-size:0.8rem">⏳ Running batch — analyze + generate + ingest for each rule...</div>';
+  try {
+    const data = await callApi('/api/batch-validate', {rules_json: JSON.stringify(parsed), use_fixtures: useFixtures, run_negative: runNeg});
+    if (data.error) { resultsEl.innerHTML = `<div style="color:var(--danger)">Error: ${escHtml(data.error)}</div>`; return; }
+    const summary = data.summary || {};
+    const rows = (data.results || []).map(r => {
+      const icon = r.status === 'ingested_awaiting_verify' ? '✅' : (r.status === 'error' || r.status === 'fail' ? '❌' : '⚠️');
+      const stages = Object.entries(r.stages || {}).map(([k,v]) => `${k}:${v.status}`).join(', ');
+      return `<tr><td>${icon}</td><td>${escHtml(r.rule_name || '')}</td><td>${escHtml(r.status)}</td><td style="font-size:0.7rem;color:var(--muted)">${escHtml(stages)}</td></tr>`;
+    }).join('');
+    resultsEl.innerHTML = `
+      <div style="margin-bottom:8px;font-size:0.85rem">Total: ${summary.total} — Ingested: ${summary.ingested} — Failed: ${summary.failed} — Skipped: ${summary.skipped || 0}</div>
+      <table style="width:100%;font-size:0.8rem;border-collapse:collapse">
+        <thead><tr style="color:var(--accent);border-bottom:1px solid var(--border)"><th align="left"></th><th align="left">Rule</th><th align="left">Status</th><th align="left">Stages</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+      <div style="font-size:0.75rem;color:var(--muted);margin-top:8px">Ingested rules still need client-side polling (~2-5 min) to confirm detection fired.</div>`;
+  } catch(e) { if (e.message !== 'Unauthorized') resultsEl.innerHTML = `<div style="color:var(--danger)">Error: ${escHtml(e.message)}</div>`; }
+}
+
+
+// ── COMPOSITE / CASCADE VALIDATION ───────────────────────────────
+async function runCascadeValidation() {
+  const rule = document.getElementById('rule-input').value.trim();
+  if (!rule) { alert('Paste a composite YARA-L rule first.'); return; }
+  addCard('🔗 Composite Analysis', 'Analyzing rule for composite structure (base components, join keys, ordering)...', 'WORKING', 'info');
+  let analysis;
+  try {
+    analysis = await callApi('/api/analyze-composite', {rule_text: rule});
+  } catch(e) { if (e.message !== 'Unauthorized') addCard('Error', e.message, 'ERROR', 'err'); return; }
+  if (analysis.error) { addCard('🔗 Composite Analysis — Error', analysis.error, 'ERROR', 'err'); return; }
+  const stages = (analysis.base_components || []).map(c => `• ${c.stage_name} (${c.event_type}) — ${c.description}`).join('\n');
+  addCard('🔗 Composite Structure',
+          `Composite: ${analysis.is_composite}\nKind: ${analysis.composite_kind}\nJoin keys: ${(analysis.join_keys||[]).join(', ')}\nOrdering: ${analysis.ordering}\nWindow: ${analysis.time_window}\n\nStages:\n${stages}\n\nCascade: ${analysis.cascade_description}`,
+          'ANALYZED', 'ok');
+
+  const baseNames = prompt('Enter comma-separated base rule names to also verify (optional, leave blank if the composite is multi-event only):', '') || '';
+
+  addCard('🔗 Cascade Validation', 'Generating chained events that fire each stage in sequence → ingesting...', 'WORKING', 'info');
+  let cascade;
+  try {
+    cascade = await callApi('/api/cascade-validate', {rule_text: rule, base_rule_names: baseNames});
+  } catch(e) { if (e.message !== 'Unauthorized') addCard('Error', e.message, 'ERROR', 'err'); return; }
+  if (cascade.error) { addCard('🔗 Cascade — Error', cascade.error, 'ERROR', 'err'); return; }
+  if (cascade.status !== 'INGESTED_AWAITING_CASCADE_VERIFY') {
+    addCard('🔗 Cascade — Failed', JSON.stringify(cascade, null, 2), 'FAIL', 'err'); return;
+  }
+  addCard('🔗 Cascade Ingested',
+          `Composite: ${cascade.composite_rule_name}\nStages: ${cascade.stage_count}\nEvents: ${cascade.event_count}\nValidation ID: ${cascade.validation_id}\nBase rules to poll: ${(cascade.base_rule_names||[]).join(', ') || '(none)'}\n\nPolling each rule every 30s...`,
+          'INGESTED', 'ok');
+
+  const toPoll = [...(cascade.base_rule_names || []), cascade.composite_rule_name].filter(Boolean);
+  const MAX_ATTEMPTS = 12;
+  const status = {};
+  toPoll.forEach(n => status[n] = 'pending');
+
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    await new Promise(r => setTimeout(r, 30000));
+    for (const ruleName of toPoll) {
+      if (status[ruleName] === 'fired') continue;
+      try {
+        const v = await callApi('/api/verify', {rule_name: ruleName, validation_id: cascade.validation_id, minutes_back: 10});
+        if (v.detection_found || v.detection_count > 0) status[ruleName] = 'fired';
+      } catch(e) { if (e.message === 'Unauthorized') return; }
+    }
+    const line = Object.entries(status).map(([n,s]) => `${s === 'fired' ? '✅' : '⏳'} ${n}`).join('\n');
+    const all = Object.values(status).every(s => s === 'fired');
+    if (all) {
+      addCard('✅ Cascade Fired', line + '\n\nAll stages + composite detected — rule chain works end-to-end.', 'PASS', 'ok');
+      return;
+    }
+  }
+  const line = Object.entries(status).map(([n,s]) => `${s === 'fired' ? '✅' : '❌'} ${n}`).join('\n');
+  addCard('❌ Cascade Timeout', line + '\n\nNot all stages fired within 6 minutes.', 'FAIL', 'err');
+}
+
 
 // ── CHAT ─────────────────────────────────────────────────────────
 function appendMsg(role, text) {

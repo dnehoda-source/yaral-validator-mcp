@@ -228,16 +228,16 @@ Return ONLY valid compact JSON, no markdown, no explanation."""
 
 @app_mcp.tool()
 def generate_synthetic_events(analysis_json: str, count: int = 5) -> str:
-    """Given the output of analyze_yara_l_rule, generate synthetic native-format security logs
-    that will trigger the rule when ingested. Returns {log_type, logs, count}."""
+    """Given the output of analyze_yara_l_rule, generate synthetic UDM events that trigger
+    the rule when ingested via ingest_udm. Returns {events: [...], count: N}."""
     try:
         analysis = json.loads(analysis_json) if isinstance(analysis_json, str) else analysis_json
     except Exception:
         analysis = {"trigger_summary": analysis_json}
 
-    min_needed  = analysis.get("min_event_count", count)
+    min_needed   = analysis.get("min_event_count", count)
     actual_count = max(count, min_needed)
-    breakdown   = analysis.get("event_breakdown", {})
+    breakdown    = analysis.get("event_breakdown", {})
 
     # Current timestamps spread across a 9-minute window so LIVE rules evaluate them
     now = datetime.now(timezone.utc)
@@ -246,45 +246,48 @@ def generate_synthetic_events(analysis_json: str, count: int = 5) -> str:
         for i in range(actual_count)
     ]
 
-    prompt = f"""Generate {actual_count} synthetic security log entries in native format to trigger this YARA-L rule.
+    prompt = f"""Generate {actual_count} synthetic UDM event objects that will trigger this YARA-L rule.
 
 Rule analysis:
 {json.dumps(analysis, indent=2)}
 
 Event breakdown needed: {json.dumps(breakdown) if breakdown else "see condition block"}
-Use THESE exact timestamps (current time, so live rules evaluate them):
+Use THESE exact timestamps (current UTC time — live rules will evaluate them):
 {json.dumps(timestamps)}
 
-STEP 1 — choose the best log type:
-- OKTA  → USER_LOGIN, auth events; maps: client.ipAddress→principal.ip, target[].alternateId→target.user.userid, outcome.result SUCCESS/FAILURE→security_result.action ALLOW/BLOCK
-- WINEVTLOG → PROCESS_LAUNCH (EventID 4688), USER_LOGIN (EventID 4624/4625); maps: SubjectUserName→principal.user.userid, NewProcessName→target.process.file.full_path, IpAddress→principal.ip
-- PAN_NGFW → NETWORK_CONNECTION/TRAFFIC; maps: src/dst IP, dst port, application
-- NGINX  → NETWORK_HTTP; maps: client IP→principal.ip, method, status, URI→target.url
+Rules for generating valid UDM events:
+- metadata.event_type must be a valid UDM enum string: USER_LOGIN, NETWORK_CONNECTION, PROCESS_LAUNCH, NETWORK_HTTP, FILE_CREATION, USER_RESOURCE_ACCESS
+- metadata.event_timestamp: use the timestamps above, one per event
+- metadata.product_name: use "synthetic-test"
+- principal.ip and target.ip must be JSON arrays of strings: ["10.0.0.5"]
+- principal.user.userid and target.user.userid: plain strings like "jsmith@corp.local"
+- security_result must be a JSON array; security_result[0].action must be a JSON array with ONE of: "ALLOW", "BLOCK"
+- Do NOT include: process.pid (causes type errors), extensions, ingestion_labels, metadata.id
+- For correlated rules (same user across events): use identical principal.user.userid and principal.ip across all events
 
-STEP 2 — generate exactly {actual_count} log entries in that format, satisfying ALL required_fields.
-For correlated rules (same $user, $src_ip, etc.) use identical values across all logs.
-Use fake realistic values: IPs 10.0.0.x, users jsmith@corp.local, hosts WKSTN-01.
-
-STEP 3 — return ONLY this JSON, no markdown:
+Return ONLY this JSON, no markdown:
 {{
-  "log_type": "CHOSEN_TYPE",
-  "logs": ["complete log string 1", "complete log string 2", ...]
+  "events": [
+    {{
+      "metadata": {{"event_timestamp": "TIMESTAMP_0", "event_type": "USER_LOGIN", "product_name": "synthetic-test"}},
+      "principal": {{"ip": ["10.0.0.5"], "user": {{"userid": "jsmith@corp.local"}}}},
+      "target": {{"application": "vpn", "user": {{"userid": "jsmith@corp.local"}}}},
+      "security_result": [{{"action": ["BLOCK"]}}]
+    }},
+    ...{actual_count - 1} more events...
+  ]
 }}
 
-OKTA log example (for USER_LOGIN FAILURE):
-{{"actor":{{"alternateId":"jsmith@corp.local","type":"User"}},"client":{{"ipAddress":"10.0.0.5"}},"eventType":"user.session.start","outcome":{{"result":"FAILURE","reason":"INCORRECT_CREDENTIALS"}},"target":[{{"alternateId":"jsmith@corp.local","type":"User"}}],"published":"TIMESTAMP"}}
-
-OKTA log example (for USER_LOGIN SUCCESS):
-{{"actor":{{"alternateId":"jsmith@corp.local","type":"User"}},"client":{{"ipAddress":"10.0.0.5"}},"eventType":"user.session.start","outcome":{{"result":"SUCCESS"}},"target":[{{"alternateId":"jsmith@corp.local","type":"User"}}],"published":"TIMESTAMP"}}"""
+Example for brute-force (5 BLOCK + 1 ALLOW, same user):
+- events 1-5: security_result=[{{"action":["BLOCK"]}}], same user/IP
+- event 6:    security_result=[{{"action":["ALLOW"]}}], same user/IP"""
 
     try:
         result = _gemini(prompt, max_tokens=8192)
         parsed = _extract_json(result)
-        if isinstance(parsed, dict) and "logs" in parsed:
-            log_type = parsed.get("log_type", "OKTA")
-            logs = parsed["logs"] if isinstance(parsed["logs"], list) else [parsed["logs"]]
-            return json.dumps({"log_type": log_type, "logs": logs, "count": len(logs)})
-        # Fallback: Gemini returned a raw array — shouldn't happen but handle gracefully
+        if isinstance(parsed, dict) and "events" in parsed:
+            events = parsed["events"] if isinstance(parsed["events"], list) else [parsed["events"]]
+            return json.dumps({"events": events, "count": len(events)})
         return json.dumps({"error": f"Generator returned unexpected format: {result[:200]}"})
     except Exception as ex:
         return json.dumps({"error": str(ex)})
@@ -392,12 +395,47 @@ def _sanitize_udm_event(e: dict) -> dict:
                 dns_type_map = {"A": 1, "NS": 2, "CNAME": 5, "MX": 15, "AAAA": 28, "TXT": 16, "PTR": 12}
                 entry["type"] = dns_type_map.get(entry["type"].upper(), 1)
 
-    # security_result and extensions contain deeply nested enum fields that the SecOps
-    # protobuf strictly validates. Gemini consistently generates values that look valid
-    # but are rejected by the API. These fields are never required to trigger a YARA-L
-    # rule (rules fire on event_type + principal/target/network conditions), so we strip
-    # them entirely to eliminate this entire class of ingestion failures.
-    e.pop("security_result", None)
+    # security_result — keep only action field with valid enum values; strip all else.
+    # extensions — strip entirely (deeply nested enums not needed to trigger rules).
+    VALID_SR_ACTIONS = {"UNKNOWN_ACTION", "ALLOW", "BLOCK", "QUARANTINE", "UNKNOWN_VERDICT"}
+    ACTION_MAP = {
+        "SUCCESS": "ALLOW", "ALLOWED": "ALLOW", "PASS": "ALLOW", "PERMIT": "ALLOW",
+        "FAILURE": "BLOCK", "FAIL": "BLOCK", "DENY": "BLOCK", "DENIED": "BLOCK",
+        "BLOCKED": "BLOCK", "REJECT": "BLOCK", "REJECTED": "BLOCK",
+    }
+    sr = e.get("security_result")
+    if isinstance(sr, list):
+        cleaned_sr = []
+        for item in sr:
+            if not isinstance(item, dict):
+                continue
+            action = item.get("action")
+            if isinstance(action, list):
+                valid_actions = [
+                    ACTION_MAP.get(str(a).upper(), str(a))
+                    for a in action
+                    if ACTION_MAP.get(str(a).upper(), str(a)) in VALID_SR_ACTIONS
+                ]
+                if valid_actions:
+                    cleaned_sr.append({"action": valid_actions})
+            elif isinstance(action, str):
+                mapped = ACTION_MAP.get(action.upper(), action)
+                if mapped in VALID_SR_ACTIONS:
+                    cleaned_sr.append({"action": [mapped]})
+        if cleaned_sr:
+            e["security_result"] = cleaned_sr
+        else:
+            e.pop("security_result", None)
+    elif isinstance(sr, dict):
+        action = sr.get("action")
+        if isinstance(action, str):
+            mapped = ACTION_MAP.get(action.upper(), action)
+            if mapped in VALID_SR_ACTIONS:
+                e["security_result"] = [{"action": [mapped]}]
+            else:
+                e.pop("security_result", None)
+        else:
+            e.pop("security_result", None)
     e.pop("extensions", None)
 
     return e
@@ -405,9 +443,8 @@ def _sanitize_udm_event(e: dict) -> dict:
 
 @app_mcp.tool()
 def ingest_synthetic_events(events_json: str) -> str:
-    """Ingest synthetic logs into SecOps for rule testing.
-    Accepts the output of generate_synthetic_events (raw logs + log_type).
-    Uses ingest_log so SecOps's own parsers handle UDM conversion — no enum issues.
+    """Ingest synthetic UDM events directly into SecOps via events:import (no parser delay).
+    Accepts the output of generate_synthetic_events ({events: [...]}).
     Returns ingestion status and a validation_id to track this test run."""
     try:
         data = json.loads(events_json) if isinstance(events_json, str) else events_json
@@ -422,32 +459,143 @@ def ingest_synthetic_events(events_json: str) -> str:
         validation_id = f"yaral-test-{uuid.uuid4().hex[:12]}"
         ingestion_time = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
 
-        # Native log format from generate_synthetic_events: {log_type, logs}
-        if isinstance(data, dict) and "log_type" in data and "logs" in data:
-            log_type = data["log_type"]
-            logs = data["logs"]
-            if not isinstance(logs, list):
-                logs = [logs]
-            logger.info(f"Ingesting {len(logs)} {log_type} logs — first: {str(logs[0])[:300]}")
-            result = client.ingest_log(
-                log_type=log_type,
-                log_message=logs,
-                force_log_type=True,
-            )
+        if isinstance(data, dict) and "events" in data:
+            events = data["events"]
+            if not isinstance(events, list):
+                events = [events]
+
+            sanitized = [_sanitize_udm_event(e) for e in events]
+            logger.info(f"Ingesting {len(sanitized)} UDM events via ingest_udm — first: {str(sanitized[0])[:300]}")
+
+            result = client.ingest_udm(sanitized)
             return json.dumps({
                 "status": "ingested",
                 "validation_id": validation_id,
-                "log_type": log_type,
-                "event_count": len(logs),
+                "method": "ingest_udm",
+                "event_count": len(sanitized),
                 "ingestion_time": ingestion_time,
                 "api_response": result,
-                "message": f"Ingested {len(logs)} {log_type} logs. SecOps parser creates UDM events. Wait 2-5 min then verify.",
+                "message": f"Ingested {len(sanitized)} UDM events directly. No parser delay — rule evaluation is near-immediate.",
             })
 
-        return json.dumps({"error": "Expected {log_type, logs} output from generate_synthetic_events"})
+        return json.dumps({"error": "Expected {events: [...]} output from generate_synthetic_events"})
 
     except Exception as e:
         return json.dumps({"error": str(e)})
+
+
+def _find_rule_id(client, rule_name: str) -> str | None:
+    """Return the ru_xxx ID for a rule matching rule_name, or None."""
+    if rule_name.startswith("ru_"):
+        return rule_name
+    rules = client.list_rules(view="FULL", as_list=True)
+    needle = rule_name.lower().strip()
+    for r in rules:
+        res_name  = r.get("name", "")
+        display   = r.get("displayName", "").lower()
+        rule_text = r.get("text", "")
+        ru_id     = res_name.split("/rules/")[-1]
+        if needle == display or needle == ru_id or f"rule {needle}" in rule_text.lower():
+            return ru_id
+    return None
+
+
+@app_mcp.tool()
+def ensure_rule_live(rule_name: str) -> str:
+    """Ensure a YARA-L rule is enabled and running at LIVE (near-real-time) frequency.
+    Call this before ingesting synthetic events so detections fire without waiting.
+    rule_name: YARA-L declaration name or ru_xxx ID."""
+    try:
+        from secops import SecOpsClient
+        client = SecOpsClient().chronicle(
+            customer_id=SECOPS_CUSTOMER_ID,
+            project_id=SECOPS_PROJECT_ID,
+            region=SECOPS_REGION,
+        )
+        rule_id = _find_rule_id(client, rule_name)
+        if not rule_id:
+            return json.dumps({"error": f"Rule '{rule_name}' not found in SecOps instance."})
+
+        deployment = client.get_rule_deployment(rule_id)
+        already_enabled = deployment.get("enabled", False)
+        already_live    = deployment.get("runFrequency", "") == "LIVE"
+
+        if already_enabled and already_live:
+            return json.dumps({
+                "rule_name": rule_name,
+                "rule_id": rule_id,
+                "status": "already_live",
+                "enabled": True,
+                "run_frequency": "LIVE",
+                "message": "Rule is already enabled and running LIVE — ready for validation.",
+            })
+
+        result = client.update_rule_deployment(rule_id, enabled=True, run_frequency="LIVE")
+        return json.dumps({
+            "rule_name": rule_name,
+            "rule_id": rule_id,
+            "status": "enabled",
+            "enabled": result.get("enabled"),
+            "run_frequency": result.get("runFrequency"),
+            "message": "Rule enabled and set to LIVE frequency — detections will fire in near real-time.",
+        })
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+def _summarize_detections(detections: list) -> list:
+    """Turn raw detection JSON into plain-English summaries the user can read."""
+    summaries = []
+    for det in detections:
+        rule_det = (det.get("detection") or [{}])[0]
+        fields = {f.get("key"): f.get("value") for f in rule_det.get("detectionFields", [])}
+        user = fields.get("user") or fields.get("principal_user") or fields.get("username") or "unknown user"
+        src  = fields.get("src_ip") or fields.get("source_ip") or fields.get("ip") or "unknown IP"
+        host = fields.get("hostname") or fields.get("host") or ""
+        severity = rule_det.get("severity", "")
+        rule_n   = rule_det.get("ruleName", "")
+
+        # Group collectionElements by label
+        groups = {}
+        for elem in det.get("collectionElements", []):
+            label = elem.get("label", "events")
+            times = []
+            for ref in elem.get("references", []):
+                ts = ref.get("event", {}).get("metadata", {}).get("eventTimestamp", "")
+                if ts:
+                    times.append(ts)
+            if times:
+                groups[label] = sorted(times)
+
+        parts = []
+        fail_times    = groups.get("fail") or groups.get("failed") or groups.get("failure")
+        success_times = groups.get("success") or groups.get("successful") or groups.get("allowed")
+
+        if fail_times and success_times:
+            fstart = fail_times[0][11:19]
+            fend   = fail_times[-1][11:19]
+            sstart = success_times[0][11:19]
+            parts.append(
+                f"{user} from {src}{' on ' + host if host else ''} failed {len(fail_times)} "
+                f"login attempts between {fstart} and {fend} UTC, then successfully "
+                f"logged in at {sstart} UTC."
+            )
+        else:
+            total_events = sum(len(t) for t in groups.values())
+            first = min((t[0] for t in groups.values() if t), default="")
+            last  = max((t[-1] for t in groups.values() if t), default="")
+            if total_events and first and last:
+                parts.append(
+                    f"{user} from {src}{' on ' + host if host else ''} "
+                    f"triggered {total_events} correlated events between "
+                    f"{first[11:19]} and {last[11:19]} UTC."
+                )
+            else:
+                parts.append(f"{user} from {src} triggered rule {rule_n}.")
+
+        headline = f"🚨 [{severity}] Detection fired on rule `{rule_n}`" if severity else f"🚨 Detection fired on rule `{rule_n}`"
+        summaries.append(f"{headline}\n{parts[0]}")
+    return summaries
 
 
 @app_mcp.tool()
@@ -464,33 +612,11 @@ def verify_rule_triggered(rule_name: str, minutes_back: int = 10, validation_id:
             region=SECOPS_REGION,
         )
 
-        # Step 1: find the rule_id for this rule_name.
-        # rule_name may be the YARA-L declaration identifier OR the ru_xxx ID directly.
-        if rule_name.startswith("ru_"):
-            rule_id = rule_name
-        else:
-            rules = client.list_rules(view="FULL", as_list=True)
-            rule_id = None
-            needle = rule_name.lower().strip()
-            for r in rules:
-                res_name  = r.get("name", "")
-                display   = r.get("displayName", "").lower()
-                rule_text = r.get("text", "")
-                ru_id     = res_name.split("/rules/")[-1]
-                if (needle == display or
-                        needle == ru_id or
-                        f"rule {needle}" in rule_text.lower() or
-                        needle in res_name.lower()):
-                    rule_id = ru_id
-                    break
-
+        rule_id = _find_rule_id(client, rule_name)
         if not rule_id:
             return json.dumps({
                 "rule_name": rule_name,
-                "error": f"Rule '{rule_name}' not found in SecOps. "
-                         "Ensure the rule is deployed (enabled or disabled) in the instance.",
-                "available_rules": [r.get("name", "").split("/rules/")[-1] + " — " +
-                                    r.get("displayName", "") for r in rules[:20]],
+                "error": f"Rule '{rule_name}' not found in SecOps. Ensure the rule is deployed.",
             })
 
         # Step 2: list detections for that rule over the time window
@@ -505,6 +631,8 @@ def verify_rule_triggered(rule_name: str, minutes_back: int = 10, validation_id:
         )
         detections = result if isinstance(result, list) else result.get("detections", [])
 
+        summaries = _summarize_detections(detections) if detections else []
+
         return json.dumps({
             "rule_name": rule_name,
             "rule_id": rule_id,
@@ -512,6 +640,7 @@ def verify_rule_triggered(rule_name: str, minutes_back: int = 10, validation_id:
             "detection_found": len(detections) > 0,
             "detection_count": len(detections),
             "time_window_minutes": minutes_back,
+            "summary": summaries,
             "detections": detections[:5],
             "verdict": (
                 "PASS ✅ — Rule fired on synthetic events" if detections else
@@ -545,7 +674,8 @@ def run_full_validation(rule_text: str, rule_name: str = "", wait_seconds: int =
 
         # Step 2: Generate events
         logger.info("Step 2: Generating synthetic events...")
-        events_raw = generate_synthetic_events(analysis_raw, count=5)
+        min_count = analysis.get("min_event_count", 5)
+        events_raw = generate_synthetic_events(analysis_raw, count=max(5, min_count))
         events_data = json.loads(events_raw)
         results["generation"] = events_data
         if "error" in events_data:
@@ -577,6 +707,488 @@ def run_full_validation(rule_text: str, rule_name: str = "", wait_seconds: int =
     except Exception as e:
         results["error"] = str(e)
         return json.dumps({"status": "ERROR", "error": str(e), "results": results})
+
+
+# ═══════════════════════════════════════════════════════════════
+# NEGATIVE TESTING — prove the rule is not over-broad
+# ═══════════════════════════════════════════════════════════════
+
+@app_mcp.tool()
+def generate_negative_events(analysis_json: str, count: int = 3) -> str:
+    """Generate near-miss UDM events that should NOT trigger the rule. Each variant perturbs
+    ONE axis of the rule's conditions so the rule stays quiet. Used for false-positive testing."""
+    try:
+        analysis = json.loads(analysis_json) if isinstance(analysis_json, str) else analysis_json
+    except Exception:
+        analysis = {"trigger_summary": analysis_json}
+
+    breakdown = analysis.get("event_breakdown", {})
+    now = datetime.now(timezone.utc)
+    timestamps = [
+        (now + timedelta(minutes=i)).strftime('%Y-%m-%dT%H:%M:%S.000Z')
+        for i in range(10)
+    ]
+
+    prompt = f"""Generate synthetic UDM events that LOOK like the attacker pattern but FAIL to trigger this rule.
+Each scenario must perturb exactly ONE axis so the rule stays silent — this proves the rule is not over-broad.
+
+Rule analysis:
+{json.dumps(analysis, indent=2)}
+
+Event breakdown: {json.dumps(breakdown) if breakdown else "see condition block"}
+Available timestamps: {json.dumps(timestamps)}
+
+Generate {count} distinct scenarios. Each scenario is a list of UDM events that violate ONE of these:
+- Threshold just below trigger (e.g. rule needs #fail>=5, generate 4 fails + 1 success)
+- Different entity (e.g. same user but different IP, or different user but same IP — breaks correlation)
+- Outside time window (e.g. events spaced 2h apart when window is 10m)
+- Wrong action value (e.g. ALLOW instead of BLOCK)
+- Missing required event type (e.g. 5 fails but NO success)
+
+Each event must be a valid UDM dict with:
+- metadata.event_timestamp, metadata.event_type, metadata.product_name="synthetic-test"
+- principal.ip as JSON array, principal.user.userid
+- target.application, target.user.userid
+- security_result[0].action as JSON array with ALLOW or BLOCK
+- NO process.pid, NO extensions, NO ingestion_labels
+
+Return ONLY this JSON, no markdown:
+{{
+  "scenarios": [
+    {{
+      "name": "threshold_minus_one",
+      "perturbation": "4 failed logins + 1 success (rule needs >=5 failed)",
+      "expected": "NO DETECTION",
+      "events": [...]
+    }},
+    {{
+      "name": "different_ip_break_correlation",
+      "perturbation": "5 failed logins from 10.0.0.5, success from different IP 10.99.99.99",
+      "expected": "NO DETECTION",
+      "events": [...]
+    }},
+    ...
+  ]
+}}"""
+
+    try:
+        result = _gemini(prompt, max_tokens=8192)
+        parsed = _extract_json(result)
+        if isinstance(parsed, dict) and "scenarios" in parsed:
+            return json.dumps({"scenarios": parsed["scenarios"], "count": len(parsed["scenarios"])})
+        return json.dumps({"error": f"Generator returned unexpected format: {str(result)[:200]}"})
+    except Exception as ex:
+        return json.dumps({"error": str(ex)})
+
+
+@app_mcp.tool()
+def ingest_negative_scenario(events_json: str) -> str:
+    """Ingest a single negative scenario's events (flat list). Returns ingestion status."""
+    try:
+        data = json.loads(events_json) if isinstance(events_json, str) else events_json
+        if isinstance(data, dict) and "events" in data:
+            events = data["events"]
+        elif isinstance(data, list):
+            events = data
+        else:
+            return json.dumps({"error": "Expected {events: [...]} or [events]"})
+
+        from secops import SecOpsClient
+        client = SecOpsClient().chronicle(
+            customer_id=SECOPS_CUSTOMER_ID,
+            project_id=SECOPS_PROJECT_ID,
+            region=SECOPS_REGION,
+        )
+        sanitized = [_sanitize_udm_event(e) for e in events]
+        validation_id = f"yaral-neg-{uuid.uuid4().hex[:12]}"
+        result = client.ingest_udm(sanitized)
+        return json.dumps({
+            "status": "ingested",
+            "validation_id": validation_id,
+            "event_count": len(sanitized),
+            "ingestion_time": datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
+            "api_response": result,
+        })
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+@app_mcp.tool()
+def verify_rule_quiet(rule_name: str, minutes_back: int = 5, validation_id: str = "") -> str:
+    """Inverse of verify_rule_triggered: confirms the rule did NOT fire in the window.
+    Used for negative-test scenarios where rule firing = FAILURE (over-broad rule)."""
+    try:
+        raw = verify_rule_triggered(rule_name, minutes_back=minutes_back, validation_id=validation_id)
+        data = json.loads(raw)
+        if "error" in data:
+            return raw
+        triggered = data.get("detection_found", False)
+        return json.dumps({
+            "rule_name": rule_name,
+            "validation_id": validation_id,
+            "triggered": triggered,
+            "detection_count": data.get("detection_count", 0),
+            "verdict": (
+                "FAIL ❌ — Rule fired on benign events (over-broad)" if triggered else
+                "PASS ✅ — Rule stayed quiet on near-miss events"
+            ),
+            "negative_pass": not triggered,
+        })
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+# ═══════════════════════════════════════════════════════════════
+# FIXTURE CACHING — save/replay successful event sets
+# ═══════════════════════════════════════════════════════════════
+
+FIXTURE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures")
+
+
+def _sanitize_fixture_name(name: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9_\-]", "_", name)[:100] or "unnamed"
+
+
+def _reset_timestamps(events: list) -> list:
+    """Rewrite event timestamps to be current (spread 1 minute apart)."""
+    now = datetime.now(timezone.utc)
+    out = []
+    for i, e in enumerate(events):
+        e = json.loads(json.dumps(e))  # deep copy
+        meta = e.setdefault("metadata", {})
+        meta["event_timestamp"] = (now + timedelta(minutes=i)).strftime('%Y-%m-%dT%H:%M:%S.000Z')
+        meta.pop("id", None)
+        out.append(e)
+    return out
+
+
+@app_mcp.tool()
+def save_fixture(rule_name: str, events_json: str, metadata_json: str = "") -> str:
+    """Save the events that successfully validated a rule as a reusable fixture.
+    Fixture is keyed by rule_name and stored at fixtures/<rule_name>.json."""
+    try:
+        os.makedirs(FIXTURE_DIR, exist_ok=True)
+        events_data = json.loads(events_json) if isinstance(events_json, str) else events_json
+        events = events_data.get("events", events_data) if isinstance(events_data, dict) else events_data
+        meta = json.loads(metadata_json) if metadata_json else {}
+
+        name = _sanitize_fixture_name(rule_name)
+        path = os.path.join(FIXTURE_DIR, f"{name}.json")
+        fixture = {
+            "rule_name": rule_name,
+            "saved_at": datetime.now(timezone.utc).isoformat(),
+            "event_count": len(events),
+            "events": events,
+            "metadata": meta,
+        }
+        with open(path, "w") as f:
+            json.dump(fixture, f, indent=2)
+        return json.dumps({"status": "saved", "path": path, "rule_name": rule_name, "event_count": len(events)})
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+@app_mcp.tool()
+def load_fixture(rule_name: str, refresh_timestamps: bool = True) -> str:
+    """Load a saved fixture for replay. If refresh_timestamps=True, rewrites timestamps to now
+    so LIVE rules evaluate the events."""
+    try:
+        name = _sanitize_fixture_name(rule_name)
+        path = os.path.join(FIXTURE_DIR, f"{name}.json")
+        if not os.path.exists(path):
+            return json.dumps({"error": f"No fixture for '{rule_name}' at {path}"})
+        with open(path) as f:
+            fixture = json.load(f)
+        events = fixture.get("events", [])
+        if refresh_timestamps:
+            events = _reset_timestamps(events)
+        return json.dumps({
+            "status": "loaded",
+            "rule_name": fixture.get("rule_name", rule_name),
+            "saved_at": fixture.get("saved_at", ""),
+            "event_count": len(events),
+            "events": events,
+        })
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+@app_mcp.tool()
+def list_fixtures() -> str:
+    """List all saved fixtures and their metadata."""
+    try:
+        if not os.path.isdir(FIXTURE_DIR):
+            return json.dumps({"fixtures": []})
+        items = []
+        for fn in sorted(os.listdir(FIXTURE_DIR)):
+            if not fn.endswith(".json"):
+                continue
+            try:
+                with open(os.path.join(FIXTURE_DIR, fn)) as f:
+                    d = json.load(f)
+                items.append({
+                    "file": fn,
+                    "rule_name": d.get("rule_name", fn[:-5]),
+                    "saved_at": d.get("saved_at", ""),
+                    "event_count": d.get("event_count", len(d.get("events", []))),
+                })
+            except Exception:
+                continue
+        return json.dumps({"fixtures": items, "count": len(items)})
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+# ═══════════════════════════════════════════════════════════════
+# BATCH VALIDATION — run pipeline across many rules
+# ═══════════════════════════════════════════════════════════════
+
+@app_mcp.tool()
+def batch_validate(rules_json: str, use_fixtures: bool = True, run_negative: bool = False) -> str:
+    """Validate multiple YARA-L rules in one pass. Returns pass/fail matrix.
+    rules_json: JSON array of {name, rule_text} entries.
+    use_fixtures: if True, replay cached fixtures when available instead of regenerating.
+    run_negative: if True, also run negative testing for each rule.
+    NOTE: This only does analyze + generate + ingest. Polling verify is done client-side."""
+    try:
+        rules = json.loads(rules_json) if isinstance(rules_json, str) else rules_json
+        if not isinstance(rules, list):
+            return json.dumps({"error": "Expected a JSON array of rules"})
+
+        results = []
+        for rule in rules:
+            name = rule.get("name", "")
+            rule_text = rule.get("rule_text", rule.get("text", ""))
+            if not rule_text:
+                results.append({"rule_name": name, "status": "skipped", "reason": "no rule_text"})
+                continue
+
+            entry = {"rule_name": name, "stages": {}}
+            try:
+                analysis_raw = analyze_yara_l_rule(rule_text)
+                analysis = json.loads(analysis_raw)
+                if "error" in analysis:
+                    entry["stages"]["analyze"] = {"status": "fail", "error": analysis["error"]}
+                    entry["status"] = "fail"
+                    results.append(entry)
+                    continue
+                entry["stages"]["analyze"] = {"status": "pass"}
+                resolved_name = analysis.get("rule_name", name)
+
+                fixture_data = None
+                if use_fixtures:
+                    fl = json.loads(load_fixture(resolved_name))
+                    if "events" in fl and "error" not in fl:
+                        fixture_data = fl
+                        entry["stages"]["fixture"] = {"status": "loaded", "event_count": fl["event_count"]}
+
+                if fixture_data:
+                    events_payload = {"events": fixture_data["events"]}
+                else:
+                    min_count = analysis.get("min_event_count", 5)
+                    gen_raw = generate_synthetic_events(analysis_raw, count=max(5, min_count))
+                    gen = json.loads(gen_raw)
+                    if "error" in gen:
+                        entry["stages"]["generate"] = {"status": "fail", "error": gen["error"]}
+                        entry["status"] = "fail"
+                        results.append(entry)
+                        continue
+                    events_payload = gen
+                    entry["stages"]["generate"] = {"status": "pass", "event_count": gen.get("count", 0)}
+
+                ingest_raw = ingest_synthetic_events(json.dumps(events_payload))
+                ingest = json.loads(ingest_raw)
+                if "error" in ingest:
+                    entry["stages"]["ingest"] = {"status": "fail", "error": ingest["error"]}
+                    entry["status"] = "fail"
+                    results.append(entry)
+                    continue
+                entry["stages"]["ingest"] = {"status": "pass", "validation_id": ingest.get("validation_id")}
+                entry["validation_id"] = ingest.get("validation_id")
+                entry["rule_name_resolved"] = resolved_name
+
+                if run_negative:
+                    neg_raw = generate_negative_events(analysis_raw, count=2)
+                    neg = json.loads(neg_raw)
+                    if "scenarios" in neg:
+                        entry["stages"]["negative_generate"] = {"status": "pass", "scenarios": len(neg["scenarios"])}
+                        entry["negative_scenarios"] = neg["scenarios"]
+
+                entry["status"] = "ingested_awaiting_verify"
+            except Exception as e:
+                entry["stages"]["error"] = str(e)
+                entry["status"] = "error"
+            results.append(entry)
+
+        summary = {
+            "total": len(results),
+            "ingested": sum(1 for r in results if r.get("status") == "ingested_awaiting_verify"),
+            "failed": sum(1 for r in results if r.get("status") in ("fail", "error")),
+            "skipped": sum(1 for r in results if r.get("status") == "skipped"),
+        }
+        return json.dumps({"summary": summary, "results": results})
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+# ═══════════════════════════════════════════════════════════════
+# COMPOSITE DETECTION — chain base rules → composite rule
+# ═══════════════════════════════════════════════════════════════
+
+COMPOSITE_MARKERS = [
+    r"\bdetection\b",
+    r"\boutcome\b",
+    r"\bgraph\b",
+    r"%\w+\.",
+]
+
+
+def _detect_composite(rule_text: str) -> dict:
+    """Heuristic: does this rule reference other rules' outcomes or multi-event joins?"""
+    has_detection_ref   = bool(re.search(r"\.detection\.", rule_text))
+    has_rule_ref        = bool(re.search(r"rule\s*=\s*\"[^\"]+\"", rule_text))
+    match_vars          = re.findall(r"\$\w+", rule_text)
+    distinct_vars       = len(set(match_vars))
+    has_multi_events    = distinct_vars >= 3
+    is_composite        = has_detection_ref or has_rule_ref or has_multi_events
+    return {
+        "is_composite": is_composite,
+        "has_detection_ref": has_detection_ref,
+        "has_rule_ref": has_rule_ref,
+        "distinct_event_vars": distinct_vars,
+        "has_multi_events": has_multi_events,
+    }
+
+
+@app_mcp.tool()
+def analyze_composite_rule(rule_text: str) -> str:
+    """Analyze a composite YARA-L rule: extract base rule dependencies, entity join keys,
+    ordering constraints, and the cascade the rule expects."""
+    heuristic = _detect_composite(rule_text)
+    prompt = f"""Analyze this YARA-L rule as a potentially COMPOSITE detection (chains multiple base detections or
+multiple event types on the same entity). Return compact JSON with ONLY these fields:
+- rule_name: YARA-L identifier after "rule "
+- is_composite: boolean (true if it requires multiple rule firings or 3+ correlated event types)
+- composite_kind: "chained_rules" | "multi_event_correlation" | "entity_join" | "none"
+- base_components: array of {{stage_name, event_type, security_result_action, description}}
+   — one entry per stage/base event set the composite needs. For chained rules, each base detection.
+   For multi-event correlation, each distinct event variable.
+- join_keys: array of strings (e.g. ["principal.user.userid", "principal.ip"]) — the entity fields
+   that must match across all stages.
+- ordering: "sequential" | "any_order" | null — do the stages need to fire in order?
+- time_window: string or null (e.g. "1h", "10m")
+- cascade_description: string — one sentence describing the full attack chain the rule catches.
+
+Return ONLY valid compact JSON.
+
+YARA-L Rule:
+```
+{rule_text}
+```"""
+    try:
+        result = _gemini(prompt, max_tokens=4096)
+        parsed = _extract_json(result)
+        parsed["heuristic"] = heuristic
+        parsed["raw_rule"] = rule_text
+        return json.dumps(parsed, indent=2)
+    except Exception as e:
+        return json.dumps({"error": str(e), "heuristic": heuristic})
+
+
+@app_mcp.tool()
+def generate_cascade_events(composite_analysis_json: str) -> str:
+    """Given a composite rule analysis, generate a chained set of UDM events that fire each stage
+    in sequence (or any order) with join_keys threaded through all of them.
+    Returns {stages: [{stage_name, events}], all_events, count}."""
+    try:
+        analysis = json.loads(composite_analysis_json) if isinstance(composite_analysis_json, str) else composite_analysis_json
+    except Exception:
+        return json.dumps({"error": "Invalid composite_analysis_json"})
+
+    stages = analysis.get("base_components", [])
+    if not stages:
+        return json.dumps({"error": "No base_components in composite analysis"})
+
+    join_keys = analysis.get("join_keys", [])
+    ordering  = analysis.get("ordering", "sequential")
+    now = datetime.now(timezone.utc)
+
+    prompt = f"""Generate a CASCADE of UDM events that fires a composite detection in sequence.
+The composite has {len(stages)} stages; generate 1-3 events per stage.
+
+Composite analysis:
+{json.dumps(analysis, indent=2)}
+
+Rules:
+- All stages must share the SAME entity values for these join_keys: {json.dumps(join_keys)}
+  (e.g. same principal.user.userid and principal.ip across every stage)
+- Events across stages must be temporally ordered if ordering="sequential" (stage 1 before stage 2, etc.)
+- Use timestamps starting at {now.strftime('%Y-%m-%dT%H:%M:%S.000Z')}, spaced 1-2 minutes apart
+- Each event must be a valid UDM dict (same schema as generate_synthetic_events)
+- security_result[0].action must be "ALLOW" or "BLOCK"
+
+Return ONLY this JSON, no markdown:
+{{
+  "stages": [
+    {{"stage_name": "stage_1_name", "events": [...UDM events...]}},
+    {{"stage_name": "stage_2_name", "events": [...UDM events...]}}
+  ]
+}}"""
+    try:
+        result = _gemini(prompt, max_tokens=8192)
+        parsed = _extract_json(result)
+        if not isinstance(parsed, dict) or "stages" not in parsed:
+            return json.dumps({"error": f"Generator returned unexpected format: {str(result)[:200]}"})
+        all_events = []
+        for stage in parsed["stages"]:
+            all_events.extend(stage.get("events", []))
+        return json.dumps({
+            "stages": parsed["stages"],
+            "all_events": all_events,
+            "count": len(all_events),
+            "stage_count": len(parsed["stages"]),
+        })
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+@app_mcp.tool()
+def cascade_validate(composite_rule_text: str, base_rule_names: str = "") -> str:
+    """End-to-end composite validation: analyze → generate cascade → ingest. Client polls each
+    base rule + composite rule to confirm the cascade fires.
+    base_rule_names: comma-separated list of base rule names (for client-side cascade polling)."""
+    try:
+        analysis_raw = analyze_composite_rule(composite_rule_text)
+        analysis = json.loads(analysis_raw)
+        if "error" in analysis:
+            return json.dumps({"status": "FAILED", "stage": "analyze", "analysis": analysis})
+
+        cascade_raw = generate_cascade_events(analysis_raw)
+        cascade = json.loads(cascade_raw)
+        if "error" in cascade:
+            return json.dumps({"status": "FAILED", "stage": "cascade_generate", "cascade": cascade})
+
+        events_payload = {"events": cascade["all_events"]}
+        ingest_raw = ingest_synthetic_events(json.dumps(events_payload))
+        ingest = json.loads(ingest_raw)
+        if "error" in ingest:
+            return json.dumps({"status": "FAILED", "stage": "ingest", "ingest": ingest})
+
+        base_rules = [n.strip() for n in base_rule_names.split(",") if n.strip()]
+        return json.dumps({
+            "status": "INGESTED_AWAITING_CASCADE_VERIFY",
+            "composite_rule_name": analysis.get("rule_name", ""),
+            "base_rule_names": base_rules,
+            "stages": cascade["stages"],
+            "stage_count": cascade["stage_count"],
+            "event_count": cascade["count"],
+            "validation_id": ingest.get("validation_id", ""),
+            "analysis": analysis,
+            "ingestion_time": ingest.get("ingestion_time", ""),
+            "next_step": f"Poll verify_rule_triggered for each of: [{', '.join(base_rules + [analysis.get('rule_name', 'composite')])}] every 30s.",
+        })
+    except Exception as e:
+        return json.dumps({"error": str(e)})
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -678,6 +1290,18 @@ async def api_validate(request: Request):
     return resp
 
 
+@app.post("/api/enable-rule")
+async def api_enable_rule(request: Request):
+    if not _verify_google_token(request):
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    body = await request.json()
+    rule_name = body.get("rule_name", "")
+    if not rule_name:
+        return JSONResponse({"error": "rule_name required"}, status_code=400)
+    result = ensure_rule_live(rule_name)
+    return JSONResponse(json.loads(result))
+
+
 @app.post("/api/verify")
 async def api_verify(request: Request):
     if not _verify_google_token(request):
@@ -687,6 +1311,133 @@ async def api_verify(request: Request):
     validation_id = body.get("validation_id", "")
     minutes_back = int(body.get("minutes_back", 10))
     result = verify_rule_triggered(rule_name, minutes_back=minutes_back, validation_id=validation_id)
+    return JSONResponse(json.loads(result))
+
+
+# ── NEGATIVE TESTING ENDPOINTS ─────────────────────────────────
+@app.post("/api/generate-negative")
+async def api_generate_negative(request: Request):
+    if not _verify_google_token(request):
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    body = await request.json()
+    analysis_json = body.get("analysis_json", "")
+    count = int(body.get("count", 3))
+    if not analysis_json:
+        return JSONResponse({"error": "No analysis provided"}, status_code=400)
+    result = generate_negative_events(analysis_json, count=count)
+    return JSONResponse(json.loads(result))
+
+
+@app.post("/api/ingest-negative")
+async def api_ingest_negative(request: Request):
+    if not _verify_google_token(request):
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    body = await request.json()
+    events_json = body.get("events_json", "")
+    if not events_json:
+        return JSONResponse({"error": "No events provided"}, status_code=400)
+    result = ingest_negative_scenario(events_json)
+    return JSONResponse(json.loads(result))
+
+
+@app.post("/api/verify-quiet")
+async def api_verify_quiet(request: Request):
+    if not _verify_google_token(request):
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    body = await request.json()
+    rule_name = body.get("rule_name", "")
+    validation_id = body.get("validation_id", "")
+    minutes_back = int(body.get("minutes_back", 5))
+    result = verify_rule_quiet(rule_name, minutes_back=minutes_back, validation_id=validation_id)
+    return JSONResponse(json.loads(result))
+
+
+# ── FIXTURE ENDPOINTS ──────────────────────────────────────────
+@app.post("/api/fixture/save")
+async def api_fixture_save(request: Request):
+    if not _verify_google_token(request):
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    body = await request.json()
+    rule_name = body.get("rule_name", "")
+    events_json = body.get("events_json", "")
+    metadata_json = body.get("metadata_json", "")
+    if not rule_name or not events_json:
+        return JSONResponse({"error": "rule_name and events_json required"}, status_code=400)
+    result = save_fixture(rule_name, events_json, metadata_json)
+    return JSONResponse(json.loads(result))
+
+
+@app.post("/api/fixture/load")
+async def api_fixture_load(request: Request):
+    if not _verify_google_token(request):
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    body = await request.json()
+    rule_name = body.get("rule_name", "")
+    refresh = bool(body.get("refresh_timestamps", True))
+    if not rule_name:
+        return JSONResponse({"error": "rule_name required"}, status_code=400)
+    result = load_fixture(rule_name, refresh_timestamps=refresh)
+    return JSONResponse(json.loads(result))
+
+
+@app.get("/api/fixture/list")
+async def api_fixture_list(request: Request):
+    if not _verify_google_token(request):
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    result = list_fixtures()
+    return JSONResponse(json.loads(result))
+
+
+# ── BATCH VALIDATION ENDPOINT ──────────────────────────────────
+@app.post("/api/batch-validate")
+async def api_batch_validate(request: Request):
+    if not _verify_google_token(request):
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    body = await request.json()
+    rules_json = body.get("rules_json", "")
+    use_fixtures = bool(body.get("use_fixtures", True))
+    run_negative = bool(body.get("run_negative", False))
+    if not rules_json:
+        return JSONResponse({"error": "rules_json required"}, status_code=400)
+    result = batch_validate(rules_json, use_fixtures=use_fixtures, run_negative=run_negative)
+    return JSONResponse(json.loads(result))
+
+
+# ── COMPOSITE DETECTION ENDPOINTS ──────────────────────────────
+@app.post("/api/analyze-composite")
+async def api_analyze_composite(request: Request):
+    if not _verify_google_token(request):
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    body = await request.json()
+    rule_text = body.get("rule_text", body.get("rule", "")).strip()
+    if not rule_text:
+        return JSONResponse({"error": "rule_text required"}, status_code=400)
+    result = analyze_composite_rule(rule_text)
+    return JSONResponse(json.loads(result))
+
+
+@app.post("/api/generate-cascade")
+async def api_generate_cascade(request: Request):
+    if not _verify_google_token(request):
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    body = await request.json()
+    analysis_json = body.get("analysis_json", "")
+    if not analysis_json:
+        return JSONResponse({"error": "analysis_json required"}, status_code=400)
+    result = generate_cascade_events(analysis_json)
+    return JSONResponse(json.loads(result))
+
+
+@app.post("/api/cascade-validate")
+async def api_cascade_validate(request: Request):
+    if not _verify_google_token(request):
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    body = await request.json()
+    rule_text = body.get("rule_text", "").strip()
+    base_rule_names = body.get("base_rule_names", "")
+    if not rule_text:
+        return JSONResponse({"error": "rule_text required"}, status_code=400)
+    result = cascade_validate(rule_text, base_rule_names)
     return JSONResponse(json.loads(result))
 
 
