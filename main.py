@@ -871,17 +871,20 @@ def ingest_synthetic_events(events_json: str) -> str:
                 events = [events]
 
             sanitized = [_sanitize_udm_event(e) for e in events]
-            logger.info(f"Ingesting {len(sanitized)} UDM events via ingest_udm — first: {str(sanitized[0])[:300]}")
+            logger.info(f"Ingesting {len(sanitized)} UDM events via ingest_log(log_type=UDM) — first: {str(sanitized[0])[:300]}")
 
-            result = client.ingest_udm(sanitized)
+            responses = []
+            for e in sanitized:
+                r = client.ingest_log(log_type="UDM", log_message=json.dumps(e))
+                responses.append(r)
             return json.dumps({
                 "status": "ingested",
                 "validation_id": validation_id,
-                "method": "ingest_udm",
+                "method": "ingest_log(UDM)",
                 "event_count": len(sanitized),
                 "ingestion_time": ingestion_time,
-                "api_response": result,
-                "message": f"Ingested {len(sanitized)} UDM events directly. No parser delay — rule evaluation is near-immediate.",
+                "api_response": responses,
+                "message": f"Ingested {len(sanitized)} UDM events via ingest_log(log_type=UDM). Parser skipped; rule evaluates within 30-60s for LIVE rules.",
             })
 
         return json.dumps({"error": "Expected {events: [...]} output from generate_synthetic_events"})
@@ -1366,13 +1369,13 @@ def ingest_negative_scenario(events_json: str) -> str:
         )
         sanitized = [_sanitize_udm_event(e) for e in events]
         validation_id = f"yaral-neg-{uuid.uuid4().hex[:12]}"
-        result = client.ingest_udm(sanitized)
+        responses = [client.ingest_log(log_type="UDM", log_message=json.dumps(e)) for e in sanitized]
         return json.dumps({
             "status": "ingested",
             "validation_id": validation_id,
             "event_count": len(sanitized),
             "ingestion_time": datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
-            "api_response": result,
+            "api_response": responses,
         })
     except Exception as e:
         return json.dumps({"error": str(e)})
