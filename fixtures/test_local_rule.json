@@ -1,0 +1,14 @@
+{
+  "rule_name": "test_local_rule",
+  "saved_at": "2026-04-20T12:29:55.777860+00:00",
+  "event_count": 1,
+  "events": [
+    {
+      "metadata": {
+        "event_timestamp": "2026-04-20T12:00:00.000Z",
+        "event_type": "USER_LOGIN"
+      }
+    }
+  ],
+  "metadata": {}
+}

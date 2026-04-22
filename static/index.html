@@ -280,7 +280,7 @@ rule detect_lateral_movement {
       </label>
       <hr class="section-divider"/>
       <div class="btn-row">
-        <button class="btn" onclick="runCascadeValidation()" title="Composite / chained detection">🔗 Composite</button>
+        <button class="btn" onclick="runCascadeValidation()" title="Validate a composite/chained rule end-to-end. SLOW: up to 1 hour for HOURLY rules, up to 24 hours for DAILY rules. You'll be warned with the wait estimate before the cascade runs.">🔗 Composite Validate</button>
         <button class="btn" onclick="openBatchPanel()" title="Validate many rules at once">📦 Batch</button>
       </div>
       <div class="btn-row">
@@ -911,58 +911,107 @@ async function runBatch() {
 
 
 // ── COMPOSITE / CASCADE VALIDATION ───────────────────────────────
+// Composite validation is SUPPORTED but slow — Chronicle schedules composite
+// evaluation on HOURLY (windows 1-24h) or DAILY (windows ≥24h) cadences, and
+// retrohunts on composites don't work. Expect up to 1 hour (HOURLY) or up to
+// 24 hours (DAILY). User must accept the wait up-front.
 async function runCascadeValidation() {
   const rule = document.getElementById('rule-input').value.trim();
   if (!rule) { alert('Paste a composite YARA-L rule first.'); return; }
-  addCard('🔗 Composite Analysis', 'Analyzing rule for composite structure (base components, join keys, ordering)...', 'WORKING', 'info');
+
+  // Stage 1: analyze to get window + cadence so we can tell the user the wait cost.
+  addCard('🔗 Composite Analysis', 'Parsing rule for composite structure (base components, join keys, ordering, match window)...', 'WORKING', 'info');
   let analysis;
   try {
     analysis = await callApi('/api/analyze-composite', {rule_text: rule});
   } catch(e) { if (e.message !== 'Unauthorized') addCard('Error', e.message, 'ERROR', 'err'); return; }
   if (analysis.error) { addCard('🔗 Composite Analysis — Error', analysis.error, 'ERROR', 'err'); return; }
-  const stages = (analysis.base_components || []).map(c => `• ${c.stage_name} (${c.event_type}) — ${c.description}`).join('\n');
+
+  const stages = (analysis.base_components || []).map(c => `• ${c.stage_name} (${c.event_type}) — ${c.description}`).join('\n') || '(none detected)';
+  const win = (analysis.time_window || '').toLowerCase();
+  let cadence = 'UNKNOWN', maxWaitMin = 60;
+  const m = win.match(/(\d+)\s*([smhd])/);
+  if (m) {
+    const n = parseInt(m[1]), unit = m[2];
+    const mins = {s: n/60, m: n, h: n*60, d: n*60*24}[unit];
+    if (mins < 60)          { cadence = 'LIVE (but Chronicle still schedules cascade evaluation — up to 1h)'; maxWaitMin = 60; }
+    else if (mins < 60*24)  { cadence = 'HOURLY'; maxWaitMin = 60; }
+    else                    { cadence = 'DAILY';  maxWaitMin = 60*24; }
+  }
+
   addCard('🔗 Composite Structure',
-          `Composite: ${analysis.is_composite}\nKind: ${analysis.composite_kind}\nJoin keys: ${(analysis.join_keys||[]).join(', ')}\nOrdering: ${analysis.ordering}\nWindow: ${analysis.time_window}\n\nStages:\n${stages}\n\nCascade: ${analysis.cascade_description}`,
+          `Composite: ${analysis.is_composite}\nKind: ${analysis.composite_kind}\nJoin keys: ${(analysis.join_keys||[]).join(', ') || '(none)'}\nOrdering: ${analysis.ordering}\nWindow: ${analysis.time_window || '(none)'}\nChronicle cadence: ${cadence}\n\nStages:\n${stages}\n\nCascade: ${analysis.cascade_description || '(n/a)'}`,
           'ANALYZED', 'ok');
 
-  const baseNames = prompt('Enter comma-separated base rule names to also verify (optional, leave blank if the composite is multi-event only):', '') || '';
+  // Stage 2: upfront wait warning — user must accept.
+  const warn = [
+    `Chronicle evaluates this composite on ${cadence} cadence.`,
+    `Worst-case wait before the cascade can fire: ~${maxWaitMin} minutes (${(maxWaitMin/60).toFixed(1)}h).`,
+    '',
+    'Caveats (Chronicle, not this tool):',
+    '  • Retrohunts do not work on composite rules — cannot fast-forward.',
+    '  • Match windows >1h force HOURLY cadence.',
+    '  • Match windows ≥24h force DAILY cadence.',
+    '  • Even LIVE composites (<1h window) evaluate on an internal schedule,',
+    '    not instantly off newly-ingested base detections.',
+    '',
+    'The only reliable way to test a composite is a ≥1h match window on HOURLY',
+    'cadence and waiting for the next scheduled run.',
+    '',
+    `Continue and wait up to ${maxWaitMin} minutes?`,
+  ].join('\n');
+  if (!confirm(warn)) {
+    addCard('🔗 Composite Validation Cancelled', 'User cancelled cascade validation.', 'CANCELLED', 'info');
+    return;
+  }
 
-  addCard('🔗 Cascade Validation', 'Generating chained events that fire each stage in sequence → ingesting...', 'WORKING', 'info');
+  addCard('🔗 Cascade Validation', 'Auto-detecting base rules from the composite → fetching their source from SecOps → generating chained events → ingesting...', 'WORKING', 'info');
   let cascade;
   try {
-    cascade = await callApi('/api/cascade-validate', {rule_text: rule, base_rule_names: baseNames});
+    cascade = await callApi('/api/cascade-validate', {rule_text: rule, base_rule_names: ''});
   } catch(e) { if (e.message !== 'Unauthorized') addCard('Error', e.message, 'ERROR', 'err'); return; }
   if (cascade.error) { addCard('🔗 Cascade — Error', cascade.error, 'ERROR', 'err'); return; }
   if (cascade.status !== 'INGESTED_AWAITING_CASCADE_VERIFY') {
     addCard('🔗 Cascade — Failed', JSON.stringify(cascade, null, 2), 'FAIL', 'err'); return;
   }
+
+  const serverWait = cascade.wait_estimate || {max_wait_minutes: maxWaitMin, cadence};
+  const detectedLabel = cascade.base_rule_names_auto_detected ? ' (auto-detected from composite)' : '';
   addCard('🔗 Cascade Ingested',
-          `Composite: ${cascade.composite_rule_name}\nStages: ${cascade.stage_count}\nEvents: ${cascade.event_count}\nValidation ID: ${cascade.validation_id}\nBase rules to poll: ${(cascade.base_rule_names||[]).join(', ') || '(none)'}\n\nPolling each rule every 30s...`,
+          `Composite: ${cascade.composite_rule_name}\nStages: ${cascade.stage_count}\nEvents: ${cascade.event_count}\nValidation ID: ${cascade.validation_id}\nBase rules${detectedLabel}: ${(cascade.base_rule_names||[]).join(', ') || '(none)'}\n\nChronicle cadence: ${serverWait.cadence}\nPolling until fired or timeout at ${serverWait.max_wait_minutes} min.\nChecking every 2 min for HOURLY, every 10 min for DAILY.`,
           'INGESTED', 'ok');
 
   const toPoll = [...(cascade.base_rule_names || []), cascade.composite_rule_name].filter(Boolean);
-  const MAX_ATTEMPTS = 12;
   const status = {};
   toPoll.forEach(n => status[n] = 'pending');
 
+  const totalMinutes = serverWait.max_wait_minutes || maxWaitMin;
+  const pollIntervalMin = totalMinutes > 180 ? 10 : 2;
+  const MAX_ATTEMPTS = Math.ceil(totalMinutes / pollIntervalMin);
+  const pollMs = pollIntervalMin * 60 * 1000;
+
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-    await new Promise(r => setTimeout(r, 30000));
+    await new Promise(r => setTimeout(r, pollMs));
     for (const ruleName of toPoll) {
       if (status[ruleName] === 'fired') continue;
       try {
-        const v = await callApi('/api/verify', {rule_name: ruleName, validation_id: cascade.validation_id, minutes_back: 10});
+        const v = await callApi('/api/verify', {rule_name: ruleName, validation_id: cascade.validation_id, minutes_back: 60});
         if (v.detection_found || v.detection_count > 0) status[ruleName] = 'fired';
       } catch(e) { if (e.message === 'Unauthorized') return; }
     }
+    const elapsedMin = attempt * pollIntervalMin;
     const line = Object.entries(status).map(([n,s]) => `${s === 'fired' ? '✅' : '⏳'} ${n}`).join('\n');
     const all = Object.values(status).every(s => s === 'fired');
     if (all) {
-      addCard('✅ Cascade Fired', line + '\n\nAll stages + composite detected — rule chain works end-to-end.', 'PASS', 'ok');
+      addCard('✅ Cascade Fired', line + `\n\nAll stages + composite detected after ~${elapsedMin} min.`, 'PASS', 'ok');
       return;
+    }
+    if (attempt % Math.max(1, Math.floor(MAX_ATTEMPTS / 4)) === 0) {
+      addCard('🔗 Cascade Still Polling', line + `\n\nElapsed: ${elapsedMin} min / ${totalMinutes} min max.`, 'WORKING', 'info');
     }
   }
   const line = Object.entries(status).map(([n,s]) => `${s === 'fired' ? '✅' : '❌'} ${n}`).join('\n');
-  addCard('❌ Cascade Timeout', line + '\n\nNot all stages fired within 6 minutes.', 'FAIL', 'err');
+  addCard('❌ Cascade Timeout', line + `\n\nNot all stages fired within ${totalMinutes} min. This can happen if Chronicle's evaluator didn't pick up the cascade on its last run — check the SecOps UI directly.`, 'FAIL', 'err');
 }
 
 

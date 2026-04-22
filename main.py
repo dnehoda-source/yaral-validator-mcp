@@ -300,13 +300,134 @@ def _to_int(val, fallback=None):
         return fallback
 
 
+VALID_UDM_TOP_LEVEL = {
+    "metadata", "principal", "target", "src", "observer", "about", "intermediary",
+    "security_result", "network", "authentication", "additional", "extracted",
+    "extensions",
+}
+
+VALID_EVENT_TYPES = {
+    "EVENTTYPE_UNSPECIFIED", "GENERIC_EVENT", "PROCESS_LAUNCH", "PROCESS_TERMINATION",
+    "PROCESS_OPEN", "PROCESS_INJECTION", "PROCESS_MODULE_LOAD",
+    "PROCESS_PRIVILEGE_ESCALATION", "PROCESS_UNCATEGORIZED",
+    "FILE_CREATION", "FILE_DELETION", "FILE_MODIFICATION", "FILE_READ", "FILE_COPY",
+    "FILE_OPEN", "FILE_MOVE", "FILE_SYNC", "FILE_UNCATEGORIZED",
+    "NETWORK_CONNECTION", "NETWORK_HTTP", "NETWORK_DNS", "NETWORK_DHCP",
+    "NETWORK_FLOW", "NETWORK_FTP", "NETWORK_SMTP", "NETWORK_UNCATEGORIZED",
+    "USER_LOGIN", "USER_LOGOUT", "USER_CREATION", "USER_DELETION",
+    "USER_CHANGE_PASSWORD", "USER_CHANGE_PERMISSIONS", "USER_COMMUNICATION",
+    "USER_BADGE_IN", "USER_RESOURCE_ACCESS", "USER_RESOURCE_CREATION",
+    "USER_RESOURCE_DELETION", "USER_RESOURCE_UPDATE_CONTENT",
+    "USER_RESOURCE_UPDATE_PERMISSIONS", "USER_UNCATEGORIZED",
+    "EMAIL_TRANSACTION", "EMAIL_UNCATEGORIZED",
+    "SCAN_FILE", "SCAN_HOST", "SCAN_VULN_HOST", "SCAN_VULN_NETWORK",
+    "SCAN_NETWORK", "SCAN_PROCESS", "SCAN_UNCATEGORIZED",
+    "SCHEDULED_TASK_CREATION", "SCHEDULED_TASK_DELETION",
+    "SCHEDULED_TASK_DISABLE", "SCHEDULED_TASK_ENABLE",
+    "SCHEDULED_TASK_MODIFICATION", "SCHEDULED_TASK_UNCATEGORIZED",
+    "SYSTEM_AUDIT_LOG_UNCATEGORIZED", "SYSTEM_AUDIT_LOG_WIPE",
+    "SERVICE_CREATION", "SERVICE_DELETION", "SERVICE_START", "SERVICE_STOP",
+    "SERVICE_MODIFICATION", "SERVICE_UNSPECIFIED",
+    "REGISTRY_CREATION", "REGISTRY_MODIFICATION", "REGISTRY_DELETION",
+    "REGISTRY_UNCATEGORIZED",
+    "SETTING_CREATION", "SETTING_MODIFICATION", "SETTING_DELETION",
+    "SETTING_UNCATEGORIZED",
+    "MUTEX_CREATION", "MUTEX_UNCATEGORIZED",
+    "RESOURCE_CREATION", "RESOURCE_DELETION", "RESOURCE_PERMISSIONS_CHANGE",
+    "RESOURCE_READ", "RESOURCE_WRITTEN",
+    "GROUP_CREATION", "GROUP_DELETION", "GROUP_MODIFICATION", "GROUP_UNCATEGORIZED",
+    "STATUS_HEARTBEAT", "STATUS_STARTUP", "STATUS_SHUTDOWN", "STATUS_UPDATE",
+    "ANALYST_UPDATE_VERDICT", "ANALYST_UPDATE_REPUTATION",
+    "ANALYST_UPDATE_SEVERITY_SCORE", "ANALYST_UPDATE_STATUS",
+    "ANALYST_UPDATE_PRIORITY", "ANALYST_UPDATE_REASON",
+    "ANALYST_UPDATE_ROOT_CAUSE", "ANALYST_UPDATE_COMMENT",
+}
+
+EVENT_TYPE_ALIASES = {
+    "PROCESS_ACTIVITY": "PROCESS_LAUNCH",
+    "PROCESS_CREATE": "PROCESS_LAUNCH",
+    "PROCESS_CREATION": "PROCESS_LAUNCH",
+    "PROCESS_START": "PROCESS_LAUNCH",
+    "PROCESS_END": "PROCESS_TERMINATION",
+    "PROCESS_EXIT": "PROCESS_TERMINATION",
+    "PROCESS_KILL": "PROCESS_TERMINATION",
+    "FILE_ACTIVITY": "FILE_MODIFICATION",
+    "FILE_WRITE": "FILE_MODIFICATION",
+    "FILE_ACCESS": "FILE_READ",
+    "NETWORK_ACTIVITY": "NETWORK_CONNECTION",
+    "NETWORK_TRAFFIC": "NETWORK_CONNECTION",
+    "DNS_QUERY": "NETWORK_DNS",
+    "HTTP_REQUEST": "NETWORK_HTTP",
+    "LOGIN": "USER_LOGIN",
+    "LOGON": "USER_LOGIN",
+    "LOGOUT": "USER_LOGOUT",
+    "LOGOFF": "USER_LOGOUT",
+    "AUTHENTICATION": "USER_LOGIN",
+    "REGISTRY_ACTIVITY": "REGISTRY_MODIFICATION",
+    "REGISTRY_WRITE": "REGISTRY_MODIFICATION",
+    "REGISTRY_CHANGE": "REGISTRY_MODIFICATION",
+    "SCHEDULED_TASK": "SCHEDULED_TASK_CREATION",
+    "SERVICE_ACTIVITY": "SERVICE_MODIFICATION",
+    "EMAIL": "EMAIL_TRANSACTION",
+}
+
+
+def _normalize_event_type(et: str, event: dict) -> str:
+    """Map invalid event_type strings to a valid UDM enum.
+    Priority: alias table → field-based inference → GENERIC_EVENT."""
+    if not et:
+        et = ""
+    et_upper = str(et).upper().strip()
+    if et_upper in VALID_EVENT_TYPES:
+        return et_upper
+    if et_upper in EVENT_TYPE_ALIASES:
+        return EVENT_TYPE_ALIASES[et_upper]
+    # Field-based inference as fallback
+    has_process = any(
+        isinstance(event.get(n), dict) and isinstance(event[n].get("process"), dict)
+        for n in ("principal", "target", "src")
+    )
+    has_network = isinstance(event.get("network"), dict)
+    has_file = any(
+        isinstance(event.get(n), dict) and isinstance(event[n].get("file"), dict)
+        for n in ("principal", "target", "src")
+    )
+    has_auth_ctx = isinstance(event.get("authentication"), dict) or (
+        isinstance(event.get("security_result"), list)
+    )
+    if has_process:
+        return "PROCESS_LAUNCH"
+    if has_network:
+        return "NETWORK_CONNECTION"
+    if has_file:
+        return "FILE_MODIFICATION"
+    if has_auth_ctx:
+        return "USER_LOGIN"
+    return "GENERIC_EVENT"
+
+
 def _sanitize_udm_event(e: dict) -> dict:
     """Strip fields that fail UDM schema validation and fix type mismatches."""
+    # Remap common Gemini mistakes BEFORE stripping unknown keys:
+    # 'extracted_fields' (flat) should be 'extracted.fields' (nested) per UDM schema
+    if "extracted_fields" in e and "extracted" not in e:
+        ef = e.pop("extracted_fields")
+        if isinstance(ef, dict):
+            e["extracted"] = {"fields": {str(k): str(v) for k, v in ef.items()}}
+
+    # Strip any top-level keys that are not real UDM fields
+    for k in list(e.keys()):
+        if k not in VALID_UDM_TOP_LEVEL:
+            e.pop(k)
+
     # metadata — strip fields that cause ingestion failures
     meta = e.get("metadata", {})
     meta.pop("ingestion_labels", None)
     # metadata.id must be a valid plain UUID — strip it, SDK will generate a correct one
     meta.pop("id", None)
+    # Normalize event_type — map aliases and invalid values to valid enums
+    if "event_type" in meta:
+        meta["event_type"] = _normalize_event_type(meta.get("event_type"), e)
     e["metadata"] = meta
 
     # Strip process.pid entirely — it must be uint32 but Gemini consistently
@@ -500,6 +621,41 @@ def _find_rule_id(client, rule_name: str) -> str | None:
     return None
 
 
+def _fetch_rule_texts_by_name(names: list) -> dict:
+    """Look up deployed rule source text for each name. Returns {found: {name: text}, missing: [names]}.
+    Used by cascade_validate to feed real base rule bodies into the generator."""
+    from secops import SecOpsClient
+    client = SecOpsClient().chronicle(
+        customer_id=SECOPS_CUSTOMER_ID,
+        project_id=SECOPS_PROJECT_ID,
+        region=SECOPS_REGION,
+    )
+    rules = client.list_rules(view="FULL", as_list=True)
+    by_display: dict = {}
+    by_decl: dict = {}
+    for r in rules:
+        text = r.get("text", "") or ""
+        display = (r.get("displayName", "") or "").lower()
+        if display:
+            by_display[display] = text
+        m = re.search(r'^\s*rule\s+([A-Za-z_][A-Za-z0-9_]*)\s*\{', text, re.MULTILINE)
+        if m:
+            by_decl[m.group(1).lower()] = text
+
+    found: dict = {}
+    missing: list = []
+    for name in names:
+        key = (name or "").strip().lower()
+        if not key:
+            continue
+        text = by_decl.get(key) or by_display.get(key)
+        if text:
+            found[name] = text
+        else:
+            missing.append(name)
+    return {"found": found, "missing": missing}
+
+
 @app_mcp.tool()
 def ensure_rule_live(rule_name: str) -> str:
     """Ensure a YARA-L rule is enabled and running at LIVE (near-real-time) frequency.
@@ -543,21 +699,79 @@ def ensure_rule_live(rule_name: str) -> str:
         return json.dumps({"error": str(e)})
 
 
+_USER_KEYS = ("user", "username", "userid", "principal_user", "principal_user_userid",
+              "user_userid", "principal_username", "target_user", "target_user_userid")
+_HOST_KEYS = ("hostname", "host", "principal_hostname", "target_hostname",
+              "src_hostname", "principal_host")
+_IP_KEYS   = ("src_ip", "source_ip", "ip", "principal_ip", "target_ip", "src_address")
+_PROC_KEYS = ("principal_process_command_line", "target_process_command_line",
+              "command_line", "principal_process_file_full_path",
+              "target_process_file_full_path", "process_file_full_path", "file_full_path")
+
+
+def _first_scalar(fields: dict, keys: tuple) -> str:
+    for k in keys:
+        v = fields.get(k)
+        if v is None:
+            continue
+        if isinstance(v, list):
+            v = next((str(x) for x in v if x), "")
+        v = str(v).strip()
+        if v and v.lower() != "unknown":
+            return v
+    return ""
+
+
+def _scan_events_for(collection_elements: list, path: list[str]) -> str:
+    """Walk a UDM path in the first event that has it; return first non-empty scalar."""
+    for elem in collection_elements:
+        for ref in elem.get("references", []):
+            node = ref.get("event", {})
+            for p in path:
+                if isinstance(node, dict):
+                    node = node.get(p)
+                else:
+                    node = None
+                    break
+            if isinstance(node, list) and node:
+                node = node[0]
+            if isinstance(node, str) and node:
+                return node
+    return ""
+
+
 def _summarize_detections(detections: list) -> list:
     """Turn raw detection JSON into plain-English summaries the user can read."""
     summaries = []
     for det in detections:
         rule_det = (det.get("detection") or [{}])[0]
-        fields = {f.get("key"): f.get("value") for f in rule_det.get("detectionFields", [])}
-        user = fields.get("user") or fields.get("principal_user") or fields.get("username") or "unknown user"
-        src  = fields.get("src_ip") or fields.get("source_ip") or fields.get("ip") or "unknown IP"
-        host = fields.get("hostname") or fields.get("host") or ""
+        # detectionFields can be repeated (array of {key,value}) OR nested under outcomes
+        raw_fields = rule_det.get("detectionFields", []) or []
+        fields = {}
+        for f in raw_fields:
+            k = f.get("key")
+            v = f.get("value") or f.get("values")
+            if k:
+                fields[k] = v
+        # Also pull from outcomes if present
+        for o in rule_det.get("outcomes", []) or []:
+            k = o.get("variable") or o.get("key")
+            v = o.get("value") or o.get("values")
+            if k and k not in fields:
+                fields[k] = v
+
         severity = rule_det.get("severity", "")
         rule_n   = rule_det.get("ruleName", "")
 
+        collection = det.get("collectionElements", []) or []
+        user = _first_scalar(fields, _USER_KEYS) or _scan_events_for(collection, ["principal", "user", "userid"]) or _scan_events_for(collection, ["target", "user", "userid"])
+        host = _first_scalar(fields, _HOST_KEYS) or _scan_events_for(collection, ["principal", "hostname"]) or _scan_events_for(collection, ["target", "hostname"])
+        src  = _first_scalar(fields, _IP_KEYS)  or _scan_events_for(collection, ["principal", "ip"])  or _scan_events_for(collection, ["src", "ip"])
+        proc = _first_scalar(fields, _PROC_KEYS) or _scan_events_for(collection, ["target", "process", "file", "full_path"]) or _scan_events_for(collection, ["principal", "process", "command_line"])
+
         # Group collectionElements by label
         groups = {}
-        for elem in det.get("collectionElements", []):
+        for elem in collection:
             label = elem.get("label", "events")
             times = []
             for ref in elem.get("references", []):
@@ -567,34 +781,39 @@ def _summarize_detections(detections: list) -> list:
             if times:
                 groups[label] = sorted(times)
 
-        parts = []
         fail_times    = groups.get("fail") or groups.get("failed") or groups.get("failure")
         success_times = groups.get("success") or groups.get("successful") or groups.get("allowed")
 
+        def _entity():
+            bits = []
+            if user: bits.append(f"user `{user}`")
+            if host: bits.append(f"on host `{host}`")
+            if src:  bits.append(f"from IP `{src}`")
+            return " ".join(bits) if bits else "an unidentified entity"
+
         if fail_times and success_times:
-            fstart = fail_times[0][11:19]
-            fend   = fail_times[-1][11:19]
-            sstart = success_times[0][11:19]
-            parts.append(
-                f"{user} from {src}{' on ' + host if host else ''} failed {len(fail_times)} "
-                f"login attempts between {fstart} and {fend} UTC, then successfully "
-                f"logged in at {sstart} UTC."
+            line = (
+                f"{_entity()} failed {len(fail_times)} login attempts between "
+                f"{fail_times[0][11:19]} and {fail_times[-1][11:19]} UTC, then successfully "
+                f"logged in at {success_times[0][11:19]} UTC."
             )
         else:
             total_events = sum(len(t) for t in groups.values())
             first = min((t[0] for t in groups.values() if t), default="")
             last  = max((t[-1] for t in groups.values() if t), default="")
+            proc_blurb = f" running `{proc}`" if proc else ""
             if total_events and first and last:
-                parts.append(
-                    f"{user} from {src}{' on ' + host if host else ''} "
-                    f"triggered {total_events} correlated events between "
-                    f"{first[11:19]} and {last[11:19]} UTC."
+                line = (
+                    f"{_entity()}{proc_blurb} triggered {total_events} correlated events "
+                    f"between {first[11:19]} and {last[11:19]} UTC."
                 )
+            elif total_events:
+                line = f"{_entity()}{proc_blurb} triggered {total_events} events."
             else:
-                parts.append(f"{user} from {src} triggered rule {rule_n}.")
+                line = f"{_entity()}{proc_blurb} triggered rule {rule_n}."
 
         headline = f"🚨 [{severity}] Detection fired on rule `{rule_n}`" if severity else f"🚨 Detection fired on rule `{rule_n}`"
-        summaries.append(f"{headline}\n{parts[0]}")
+        summaries.append(f"{headline}\n{line}")
     return summaries
 
 
@@ -663,6 +882,17 @@ def run_full_validation(rule_text: str, rule_name: str = "", wait_seconds: int =
     Returns a full validation report with pass/fail verdict."""
     results = {}
     try:
+        # Composite rules route to the cascade flow — this single-rule pipeline doesn't fit.
+        comp = _detect_composite(rule_text)
+        if comp["is_composite"]:
+            return json.dumps({
+                "status": "USE_CASCADE_VALIDATE",
+                "is_composite": True,
+                "heuristic": comp,
+                "message": _COMPOSITE_WARNING,
+                "next_step": "Use cascade_validate (or the 'Composite Validate' button in the UI) instead of run_full_validation. Composite validation is supported but takes up to 1-24 hours depending on match window.",
+            })
+
         # Step 1: Analyze
         logger.info("Step 1: Analyzing YARA-L rule...")
         analysis_raw = analyze_yara_l_rule(rule_text)
@@ -840,9 +1070,12 @@ def verify_rule_quiet(rule_name: str, minutes_back: int = 5, validation_id: str 
 
 # ═══════════════════════════════════════════════════════════════
 # FIXTURE CACHING — save/replay successful event sets
+# Backend: GCS if FIXTURE_BUCKET env var is set; else local disk.
 # ═══════════════════════════════════════════════════════════════
 
 FIXTURE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures")
+FIXTURE_BUCKET = os.getenv("FIXTURE_BUCKET", "")
+FIXTURE_PREFIX = os.getenv("FIXTURE_PREFIX", "fixtures/")
 
 
 def _sanitize_fixture_name(name: str) -> str:
@@ -862,18 +1095,96 @@ def _reset_timestamps(events: list) -> list:
     return out
 
 
+def _gcs_bucket():
+    from google.cloud import storage
+    client = storage.Client(project=SECOPS_PROJECT_ID) if SECOPS_PROJECT_ID else storage.Client()
+    return client.bucket(FIXTURE_BUCKET)
+
+
+def _fixture_backend() -> str:
+    return "gcs" if FIXTURE_BUCKET else "local"
+
+
+def _gcs_blob_name(name: str) -> str:
+    return f"{FIXTURE_PREFIX}{name}.json"
+
+
+def _fixture_write(name: str, payload: dict) -> str:
+    """Returns a location string describing where the fixture was written."""
+    body = json.dumps(payload, indent=2)
+    if FIXTURE_BUCKET:
+        bucket = _gcs_bucket()
+        blob = bucket.blob(_gcs_blob_name(name))
+        blob.upload_from_string(body, content_type="application/json")
+        return f"gs://{FIXTURE_BUCKET}/{_gcs_blob_name(name)}"
+    os.makedirs(FIXTURE_DIR, exist_ok=True)
+    path = os.path.join(FIXTURE_DIR, f"{name}.json")
+    with open(path, "w") as f:
+        f.write(body)
+    return path
+
+
+def _fixture_read(name: str) -> dict | None:
+    if FIXTURE_BUCKET:
+        bucket = _gcs_bucket()
+        blob = bucket.blob(_gcs_blob_name(name))
+        if not blob.exists():
+            return None
+        return json.loads(blob.download_as_text())
+    path = os.path.join(FIXTURE_DIR, f"{name}.json")
+    if not os.path.exists(path):
+        return None
+    with open(path) as f:
+        return json.load(f)
+
+
+def _fixture_list() -> list[dict]:
+    items = []
+    if FIXTURE_BUCKET:
+        bucket = _gcs_bucket()
+        for blob in bucket.list_blobs(prefix=FIXTURE_PREFIX):
+            if not blob.name.endswith(".json"):
+                continue
+            try:
+                d = json.loads(blob.download_as_text())
+                items.append({
+                    "file": blob.name.rsplit("/", 1)[-1],
+                    "rule_name": d.get("rule_name", ""),
+                    "saved_at": d.get("saved_at", ""),
+                    "event_count": d.get("event_count", len(d.get("events", []))),
+                })
+            except Exception:
+                continue
+        return items
+    if not os.path.isdir(FIXTURE_DIR):
+        return []
+    for fn in sorted(os.listdir(FIXTURE_DIR)):
+        if not fn.endswith(".json"):
+            continue
+        try:
+            with open(os.path.join(FIXTURE_DIR, fn)) as f:
+                d = json.load(f)
+            items.append({
+                "file": fn,
+                "rule_name": d.get("rule_name", fn[:-5]),
+                "saved_at": d.get("saved_at", ""),
+                "event_count": d.get("event_count", len(d.get("events", []))),
+            })
+        except Exception:
+            continue
+    return items
+
+
 @app_mcp.tool()
 def save_fixture(rule_name: str, events_json: str, metadata_json: str = "") -> str:
     """Save the events that successfully validated a rule as a reusable fixture.
-    Fixture is keyed by rule_name and stored at fixtures/<rule_name>.json."""
+    Stored in GCS if FIXTURE_BUCKET is set, else local disk."""
     try:
-        os.makedirs(FIXTURE_DIR, exist_ok=True)
         events_data = json.loads(events_json) if isinstance(events_json, str) else events_json
         events = events_data.get("events", events_data) if isinstance(events_data, dict) else events_data
         meta = json.loads(metadata_json) if metadata_json else {}
 
         name = _sanitize_fixture_name(rule_name)
-        path = os.path.join(FIXTURE_DIR, f"{name}.json")
         fixture = {
             "rule_name": rule_name,
             "saved_at": datetime.now(timezone.utc).isoformat(),
@@ -881,29 +1192,26 @@ def save_fixture(rule_name: str, events_json: str, metadata_json: str = "") -> s
             "events": events,
             "metadata": meta,
         }
-        with open(path, "w") as f:
-            json.dump(fixture, f, indent=2)
-        return json.dumps({"status": "saved", "path": path, "rule_name": rule_name, "event_count": len(events)})
+        location = _fixture_write(name, fixture)
+        return json.dumps({"status": "saved", "location": location, "backend": _fixture_backend(), "rule_name": rule_name, "event_count": len(events)})
     except Exception as e:
         return json.dumps({"error": str(e)})
 
 
 @app_mcp.tool()
 def load_fixture(rule_name: str, refresh_timestamps: bool = True) -> str:
-    """Load a saved fixture for replay. If refresh_timestamps=True, rewrites timestamps to now
-    so LIVE rules evaluate the events."""
+    """Load a saved fixture for replay. If refresh_timestamps=True, rewrites timestamps to now."""
     try:
         name = _sanitize_fixture_name(rule_name)
-        path = os.path.join(FIXTURE_DIR, f"{name}.json")
-        if not os.path.exists(path):
-            return json.dumps({"error": f"No fixture for '{rule_name}' at {path}"})
-        with open(path) as f:
-            fixture = json.load(f)
+        fixture = _fixture_read(name)
+        if fixture is None:
+            return json.dumps({"error": f"No fixture for '{rule_name}' (backend: {_fixture_backend()})"})
         events = fixture.get("events", [])
         if refresh_timestamps:
             events = _reset_timestamps(events)
         return json.dumps({
             "status": "loaded",
+            "backend": _fixture_backend(),
             "rule_name": fixture.get("rule_name", rule_name),
             "saved_at": fixture.get("saved_at", ""),
             "event_count": len(events),
@@ -917,24 +1225,8 @@ def load_fixture(rule_name: str, refresh_timestamps: bool = True) -> str:
 def list_fixtures() -> str:
     """List all saved fixtures and their metadata."""
     try:
-        if not os.path.isdir(FIXTURE_DIR):
-            return json.dumps({"fixtures": []})
-        items = []
-        for fn in sorted(os.listdir(FIXTURE_DIR)):
-            if not fn.endswith(".json"):
-                continue
-            try:
-                with open(os.path.join(FIXTURE_DIR, fn)) as f:
-                    d = json.load(f)
-                items.append({
-                    "file": fn,
-                    "rule_name": d.get("rule_name", fn[:-5]),
-                    "saved_at": d.get("saved_at", ""),
-                    "event_count": d.get("event_count", len(d.get("events", []))),
-                })
-            except Exception:
-                continue
-        return json.dumps({"fixtures": items, "count": len(items)})
+        items = _fixture_list()
+        return json.dumps({"fixtures": items, "count": len(items), "backend": _fixture_backend()})
     except Exception as e:
         return json.dumps({"error": str(e)})
 
@@ -1044,20 +1336,77 @@ COMPOSITE_MARKERS = [
 
 
 def _detect_composite(rule_text: str) -> dict:
-    """Heuristic: does this rule reference other rules' outcomes or multi-event joins?"""
-    has_detection_ref   = bool(re.search(r"\.detection\.", rule_text))
-    has_rule_ref        = bool(re.search(r"rule\s*=\s*\"[^\"]+\"", rule_text))
-    match_vars          = re.findall(r"\$\w+", rule_text)
-    distinct_vars       = len(set(match_vars))
-    has_multi_events    = distinct_vars >= 3
-    is_composite        = has_detection_ref or has_rule_ref or has_multi_events
+    """Heuristic: does this rule reference other rules' detections (true composite)?"""
+    # Only rules that reference $var.detection.* or rule_name = "..." are true composites
+    # that chain off other rules' detection output.
+    has_detection_ref = bool(re.search(r"\$\w+\.detection\.", rule_text))
+    has_rule_name_ref = bool(re.search(r"\.rule_name\s*=\s*\"", rule_text))
+    is_composite      = has_detection_ref or has_rule_name_ref
+    match_window      = ""
+    m = re.search(r"match:\s*[^\n]*?over\s+(\d+[smhd])", rule_text)
+    if m:
+        match_window = m.group(1)
     return {
         "is_composite": is_composite,
         "has_detection_ref": has_detection_ref,
-        "has_rule_ref": has_rule_ref,
-        "distinct_event_vars": distinct_vars,
-        "has_multi_events": has_multi_events,
+        "has_rule_name_ref": has_rule_name_ref,
+        "match_window": match_window,
+        "base_rule_refs": _extract_base_rule_refs(rule_text),
     }
+
+
+def _extract_base_rule_refs(rule_text: str) -> list:
+    """Pull every literal base-rule name referenced in a composite via
+    $var.detection.detection.rule_name = "..." or similar selectors. De-duplicated, preserves order."""
+    seen: list = []
+    for m in re.finditer(r'\.rule_name\s*(?:=|in)\s*(?:\[\s*)?"([^"]+)"', rule_text):
+        name = m.group(1).strip()
+        if name and name not in seen:
+            seen.append(name)
+    # Also catch multi-value `rule_name in ["a", "b"]` lists
+    for m in re.finditer(r'\.rule_name\s+in\s*\[([^\]]+)\]', rule_text):
+        for lit in re.findall(r'"([^"]+)"', m.group(1)):
+            lit = lit.strip()
+            if lit and lit not in seen:
+                seen.append(lit)
+    return seen
+
+
+# Chronicle composite-rule constraints that shape the wait time for validation:
+# 1. Retrohunts on composite rules return an empty name silently — cannot fast-forward.
+# 2. Match windows >1h are forced to HOURLY cadence (≤1h wait per evaluation cycle).
+# 3. Match windows ≥24h are forced to DAILY cadence (≤24h wait per evaluation cycle).
+# 4. Match windows <1h run LIVE but re-evaluation is still on an internal schedule that
+#    may not chain instantly off newly-ingested base detections — expect up to an hour.
+# The tool will still validate composites — it just needs the user to know the wait.
+_COMPOSITE_WARNING = (
+    "Composite rules correlate detections from other rules via $var.detection.*. "
+    "Validating them is SUPPORTED but SLOW due to Chronicle's scheduling behavior: "
+    "(a) retrohunts don't work on composite rules, (b) match windows >1h force HOURLY "
+    "cadence, (c) match windows ≥24h force DAILY cadence, and (d) even LIVE composites "
+    "evaluate on Chronicle's internal schedule — not instantly off new base detections. "
+    "Expect the full cascade to take up to 1 hour for HOURLY rules and up to 24 hours "
+    "for DAILY rules. The only reliable way to test a composite is to use a match "
+    "window ≥1h (HOURLY cadence) and wait for the next run cycle."
+)
+
+
+def _estimate_composite_wait(time_window: str) -> dict:
+    """Given a YARA-L time_window string (e.g. '30m', '1h', '24h'), estimate the
+    Chronicle cadence and the worst-case wait before the composite can fire."""
+    if not time_window:
+        return {"cadence": "UNKNOWN", "max_wait_minutes": 60, "explanation": "No match window parsed — assume up to 1 hour."}
+    tw = time_window.strip().lower()
+    m = re.match(r"(\d+)\s*([smhd])", tw)
+    if not m:
+        return {"cadence": "UNKNOWN", "max_wait_minutes": 60, "explanation": f"Unparseable window '{time_window}' — assume up to 1 hour."}
+    n, unit = int(m.group(1)), m.group(2)
+    minutes = {"s": n / 60, "m": n, "h": n * 60, "d": n * 60 * 24}[unit]
+    if minutes < 60:
+        return {"cadence": "LIVE", "max_wait_minutes": 60, "explanation": "Window <1h → LIVE, but Chronicle's schedule still makes cascade evaluation take up to 1 hour."}
+    if minutes < 60 * 24:
+        return {"cadence": "HOURLY", "max_wait_minutes": 60, "explanation": "Window 1–24h → HOURLY cadence, next run within 1 hour."}
+    return {"cadence": "DAILY", "max_wait_minutes": 60 * 24, "explanation": "Window ≥24h → DAILY cadence, next run within 24 hours."}
 
 
 @app_mcp.tool()
@@ -1096,25 +1445,70 @@ YARA-L Rule:
 
 
 @app_mcp.tool()
-def generate_cascade_events(composite_analysis_json: str) -> str:
+def generate_cascade_events(composite_analysis_json: str, base_rule_texts_json: str = "") -> str:
     """Given a composite rule analysis, generate a chained set of UDM events that fire each stage
     in sequence (or any order) with join_keys threaded through all of them.
+    base_rule_texts_json: optional {name: rule_text} — when provided, each stage's events are
+    generated against the actual base rule source, which is the only way the cascade actually fires.
     Returns {stages: [{stage_name, events}], all_events, count}."""
     try:
         analysis = json.loads(composite_analysis_json) if isinstance(composite_analysis_json, str) else composite_analysis_json
     except Exception:
         return json.dumps({"error": "Invalid composite_analysis_json"})
 
+    base_rule_texts: dict = {}
+    if base_rule_texts_json:
+        try:
+            base_rule_texts = json.loads(base_rule_texts_json) if isinstance(base_rule_texts_json, str) else base_rule_texts_json
+        except Exception:
+            return json.dumps({"error": "Invalid base_rule_texts_json"})
+
     stages = analysis.get("base_components", [])
-    if not stages:
-        return json.dumps({"error": "No base_components in composite analysis"})
+    if not stages and not base_rule_texts:
+        return json.dumps({"error": "No base_components in composite analysis and no base rule texts supplied"})
 
     join_keys = analysis.get("join_keys", [])
     ordering  = analysis.get("ordering", "sequential")
     now = datetime.now(timezone.utc)
 
-    prompt = f"""Generate a CASCADE of UDM events that fires a composite detection in sequence.
-The composite has {len(stages)} stages; generate 1-3 events per stage.
+    if base_rule_texts:
+        base_section = "\n\n".join(
+            f"=== Base rule: {name} ===\n{text}" for name, text in base_rule_texts.items()
+        )
+        stage_count = len(base_rule_texts)
+        stage_names_hint = list(base_rule_texts.keys())
+        prompt = f"""Generate RAW UDM telemetry events that cause each base rule below to fire. The composite rule correlates those base-rule detections, so we need the base rules to fire first.
+
+CRITICAL: Generate raw UDM telemetry — event types like PROCESS_LAUNCH, NETWORK_CONNECTION, FILE_CREATION, USER_LOGIN, USER_UNCATEGORIZED, EMAIL_TRANSACTION, etc. DO NOT generate events with metadata.event_type = "DETECTION". DETECTION records are outputs of the SecOps rule engine, not inputs. Your events are ingested as raw telemetry; the engine then runs the base rules against them and emits its own DETECTION records.
+
+For each base rule below, generate 1-3 UDM events that satisfy that rule's $eN field filters (metadata.event_type, network.*, principal.*, target.*, security_result.*, etc.). Each event must match the conditions in the `events {{ ... }}` section of the corresponding base rule.
+
+Composite rule analysis (join keys, ordering, time window):
+{json.dumps(analysis, indent=2)}
+
+{base_section}
+
+Hard rules:
+- The entity values for these join_keys MUST be identical across every stage: {json.dumps(join_keys)}
+  (e.g. same principal.user.userid, principal.hostname, and principal.ip across all stages)
+- If ordering="sequential", stage N timestamps must be strictly earlier than stage N+1
+- Timestamps start at {now.strftime('%Y-%m-%dT%H:%M:%S.000Z')} and are spaced 30-90 seconds apart across the whole cascade
+- security_result[0].action MUST be "ALLOW" or "BLOCK" where present
+- metadata.event_type MUST be a valid UDM type matched by the base rule (inspect each rule's $eN.metadata.event_type filter)
+- Omit any DETECTION-shaped fields ($var.detection.*, outcomes, rule_name); those are composite concerns, not telemetry
+
+Return ONLY this JSON, no markdown fences:
+{{
+  "stages": [
+    {", ".join(f'{{"stage_name": "{n}", "events": [...raw UDM events that trigger {n}...]}}' for n in stage_names_hint)}
+  ]
+}}"""
+    else:
+        stage_count = len(stages)
+        prompt = f"""Generate a CASCADE of UDM events that fires a composite detection in sequence.
+The composite has {stage_count} stages; generate 1-3 events per stage.
+
+CRITICAL: Generate raw UDM telemetry (PROCESS_LAUNCH, NETWORK_CONNECTION, FILE_CREATION, USER_LOGIN, etc.). DO NOT set metadata.event_type = "DETECTION". Detections are engine outputs; your events are telemetry inputs.
 
 Composite analysis:
 {json.dumps(analysis, indent=2)}
@@ -1154,16 +1548,47 @@ Return ONLY this JSON, no markdown:
 
 @app_mcp.tool()
 def cascade_validate(composite_rule_text: str, base_rule_names: str = "") -> str:
-    """End-to-end composite validation: analyze → generate cascade → ingest. Client polls each
-    base rule + composite rule to confirm the cascade fires.
-    base_rule_names: comma-separated list of base rule names (for client-side cascade polling)."""
+    """End-to-end composite validation: analyze → fetch base rule sources → generate cascade →
+    ingest. Client polls each base rule + composite rule to confirm the cascade fires. Composite
+    validation is SLOW — expect up to 1 hour for rules with match windows 1-24h, up to 24 hours
+    for windows ≥24h.
+    base_rule_names: comma-separated names of the base rules the composite depends on. Those
+    rules MUST already be deployed LIVE in SecOps; the validator fetches their source to generate
+    raw UDM that actually fires them."""
     try:
         analysis_raw = analyze_composite_rule(composite_rule_text)
         analysis = json.loads(analysis_raw)
         if "error" in analysis:
             return json.dumps({"status": "FAILED", "stage": "analyze", "analysis": analysis})
 
-        cascade_raw = generate_cascade_events(analysis_raw)
+        wait_info = _estimate_composite_wait(analysis.get("time_window", ""))
+
+        base_rules = [n.strip() for n in base_rule_names.split(",") if n.strip()]
+        auto_detected = False
+        if not base_rules:
+            base_rules = _extract_base_rule_refs(composite_rule_text)
+            auto_detected = bool(base_rules)
+        base_rule_texts: dict = {}
+        if base_rules:
+            fetch = _fetch_rule_texts_by_name(base_rules)
+            if fetch["missing"]:
+                return json.dumps({
+                    "status": "FAILED",
+                    "stage": "fetch_base_rules",
+                    "missing_rules": fetch["missing"],
+                    "base_rule_names_resolved": base_rules,
+                    "auto_detected": auto_detected,
+                    "message": (
+                        f"Base rules not deployed in SecOps: {fetch['missing']}. "
+                        "Deploy them LIVE first — the composite can only fire when its base rules fire."
+                    ),
+                })
+            base_rule_texts = fetch["found"]
+
+        cascade_raw = generate_cascade_events(
+            analysis_raw,
+            base_rule_texts_json=json.dumps(base_rule_texts) if base_rule_texts else "",
+        )
         cascade = json.loads(cascade_raw)
         if "error" in cascade:
             return json.dumps({"status": "FAILED", "stage": "cascade_generate", "cascade": cascade})
@@ -1174,18 +1599,21 @@ def cascade_validate(composite_rule_text: str, base_rule_names: str = "") -> str
         if "error" in ingest:
             return json.dumps({"status": "FAILED", "stage": "ingest", "ingest": ingest})
 
-        base_rules = [n.strip() for n in base_rule_names.split(",") if n.strip()]
         return json.dumps({
             "status": "INGESTED_AWAITING_CASCADE_VERIFY",
             "composite_rule_name": analysis.get("rule_name", ""),
             "base_rule_names": base_rules,
+            "base_rule_names_auto_detected": auto_detected,
+            "base_rules_used_for_generation": list(base_rule_texts.keys()),
             "stages": cascade["stages"],
             "stage_count": cascade["stage_count"],
             "event_count": cascade["count"],
             "validation_id": ingest.get("validation_id", ""),
             "analysis": analysis,
             "ingestion_time": ingest.get("ingestion_time", ""),
-            "next_step": f"Poll verify_rule_triggered for each of: [{', '.join(base_rules + [analysis.get('rule_name', 'composite')])}] every 30s.",
+            "warning": _COMPOSITE_WARNING,
+            "wait_estimate": wait_info,
+            "next_step": f"Poll verify_rule_triggered for each of: [{', '.join(base_rules + [analysis.get('rule_name', 'composite')])}] on the cadence indicated by wait_estimate (up to {wait_info['max_wait_minutes']} minutes).",
         })
     except Exception as e:
         return json.dumps({"error": str(e)})

@@ -10,7 +10,7 @@ That works in a live environment. It falls apart everywhere else:
 
 - **SIEM migrations** — You're converting rules from a legacy SIEM into a SecOps tenant with no ingested logs. No data to retrohunt against. No way to know a converted rule will fire until real traffic starts flowing, which is also when it matters most.
 - **Regression testing** — Every time you edit a shared detection library, you have no way to prove the rule you just touched still fires and still doesn't false-positive, short of waiting for production traffic.
-- **Composite detections** — Rules that chain off other rules (`rule = "stage1_brute_force"` → `stage2_lateral_movement`) are especially brittle. One broken link kills the whole chain and nobody notices until an incident slips through.
+- **Composite detections** — Rules that chain off other rules (`rule = "stage1_brute_force"` → `stage2_lateral_movement`) are especially brittle. One broken link kills the whole chain and nobody notices until an incident slips through. The tool validates these end-to-end, but because Chronicle evaluates composites on an HOURLY or DAILY schedule, expect to wait up to 1 hour (HOURLY) or 24 hours (DAILY) for the cascade to fire.
 - **False positives** — A rule that fires on the happy path can still be over-broad. Proving it doesn't fire on near-miss traffic is a separate problem nobody currently solves programmatically.
 
 A rule can be syntactically valid, pass a linter, and still never fire because a field mapping is wrong, a threshold is off by one, or a condition doesn't match how the data source actually formats events. There is no standard validation step in the detection lifecycle — rules are written and shipped with the assumption they work.
@@ -21,13 +21,15 @@ This server adds a validation layer you can run before shipping. You paste a YAR
 
 Five validation modes:
 
-| Mode | What it proves |
-|------|----------------|
-| **Positive** | Rule fires when the attack pattern is present |
-| **Negative** | Rule stays quiet on near-miss traffic (not over-broad) |
-| **Fixture replay** | Deterministic re-run using cached events instead of regenerating |
-| **Batch** | Pass/fail matrix across many rules in one go |
-| **Composite cascade** | Upstream rules fire → downstream composite rule fires |
+| Mode | What it proves | Speed |
+|------|----------------|-------|
+| **Positive** | Rule fires when the attack pattern is present | <5 min |
+| **Negative** | Rule stays quiet on near-miss traffic (not over-broad) | <5 min |
+| **Fixture replay** | Deterministic re-run using cached events instead of regenerating | <5 min |
+| **Batch** | Pass/fail matrix across many rules in one go | <5 min per rule |
+| **Composite cascade** | Upstream rules fire → downstream composite rule fires | **up to 1h (HOURLY) or 24h (DAILY)** |
+
+Composite cascade is supported but slow — Chronicle schedules composite evaluation on HOURLY (windows 1–24h) or DAILY (windows ≥24h) cadences and rejects retrohunts on composites, so there is no fast path. The UI warns up-front with the expected wait (derived from the rule's match window) before ingesting the cascade, and keeps polling until the next scheduled run lands or the wait expires. The only reliable way to test a composite is a ≥1h match window on HOURLY cadence.
 
 ## The Workflow
 
@@ -92,9 +94,9 @@ UDM events are ingested via `events:import` directly — parsing is skipped enti
 **Composite detections**
 | Tool | Description |
 |------|-------------|
-| `analyze_composite_rule` | Detects rule chains (references to `.detection.` fields or base rule names) |
+| `analyze_composite_rule` | Detects rule chains and explains structure (base components, join keys, ordering, window) |
 | `generate_cascade_events` | Generates event sets that trigger each base rule in the chain |
-| `cascade_validate` | End-to-end: triggers base rules, waits, confirms composite fires |
+| `cascade_validate` | End-to-end: analyzes, generates, ingests — then returns a wait estimate (up to 1h HOURLY or 24h DAILY). Client polls on the matching cadence until the composite fires. |
 
 ## Detection Summaries
 
@@ -174,7 +176,7 @@ Open `http://localhost:8080`. Fixtures persist in `./fixtures/` across restarts 
 Or click **🚀 Full Validation** to run the whole pipeline. Enable the **Negative** toggle to also run false-positive tests. Passing validations are cached as fixtures automatically.
 
 Additional buttons:
-- **🔗 Composite** — cascade validation for multi-stage rules
+- **🔗 Composite Validate** — end-to-end cascade validation for multi-stage rules. Analyzes structure, shows the expected wait (up to 1h HOURLY, up to 24h DAILY), asks for confirmation, then ingests the cascade and polls until it fires. Slow by design — see "What It Is Not" for why.
 - **📦 Batch** — paste a list of rules, get a pass/fail matrix
 - **📂 Fixtures** — browse saved fixtures and replay any of them
 - **💾 Save** — manually cache the current generated events
@@ -195,6 +197,7 @@ Honest scope so you don't get surprised:
 - **Not a replacement for production telemetry.** Synthetic events prove the rule *can* fire on the pattern you described. Real data can still surface corner cases the synthetic generator didn't think of.
 - **Not deterministic by default.** Gemini generation varies run-to-run; use fixture caching to lock an event set for regression tests.
 - **Negative testing is bounded by imagination.** The tool generates five perturbation axes (threshold, entity, time window, action, missing event type). It won't catch every false-positive class — only the ones it knows how to perturb.
+- **Not a <5-minute composite validator.** Composite / cascade rules (those referencing `$var.detection.*` or other rules by name) *are* validated end-to-end, but slowly. Chronicle schedules composite evaluation on HOURLY cadence for match windows 1–24h and DAILY cadence for windows ≥24h, and retrohunts on composite rules don't work — so the worst-case wait is up to 1 hour (HOURLY) or up to 24 hours (DAILY). The tool tells you the expected wait up front, asks for confirmation, and then polls until the cascade fires or the wait expires. If you need faster feedback, validate each base rule here individually (that path is <5 min) and deploy the composite separately.
 
 ## Security
 
