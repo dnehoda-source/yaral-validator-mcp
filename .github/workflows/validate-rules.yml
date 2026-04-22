@@ -1,0 +1,120 @@
+# YARA-L rule validation on pull requests.
+#
+# Drop this file into your rules repo at .github/workflows/validate-rules.yml,
+# set the three secrets/variables below, and every PR that touches a *.yaral
+# file under rules/ will be validated against your deployed YARA-L Validator
+# instance. Rules that fail to fire or that err out block the merge.
+#
+# Required repository configuration:
+#   Secrets:
+#     GCP_WORKLOAD_IDENTITY_PROVIDER  full resource name of your WIF provider
+#     GCP_SERVICE_ACCOUNT             service account email (format: sa@proj.iam.gserviceaccount.com)
+#   Variables (Settings → Secrets and variables → Actions → Variables):
+#     VALIDATOR_URL                   e.g. https://yaral-validator-xxxx.a.run.app
+#
+# The service account referenced above must be in ALLOWED_EMAILS on the
+# validator. WIF lets the Action mint a short-lived ID token without storing
+# a JSON key in the repo.
+
+name: yara-l-rules
+on:
+  pull_request:
+    paths:
+      - "rules/**"
+      - ".github/workflows/validate-rules.yml"
+
+permissions:
+  contents: read
+  id-token: write
+  pull-requests: write
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install CLI
+        run: |
+          pip install requests
+          # Fetch the CLI from the validator repo. Pin to a tag in production.
+          curl -fsSL https://raw.githubusercontent.com/dnehoda-source/yaral-validator-mcp/master/cli/validate_changed.py \
+            -o validate_changed.py
+
+      - name: Auth to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+          token_format: "id_token"
+          id_token_audience: ${{ vars.VALIDATOR_URL }}
+
+      - name: Validate changed rules
+        id: validate
+        env:
+          VALIDATOR_URL: ${{ vars.VALIDATOR_URL }}
+          VALIDATOR_ID_TOKEN: ${{ steps.auth.outputs.id_token }}
+        run: |
+          python validate_changed.py \
+            --rules-dir rules \
+            --base "origin/${{ github.base_ref }}" \
+            --out results.json \
+            --markdown results.md
+        continue-on-error: true
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: yara-l-results
+          path: |
+            results.json
+            results.md
+
+      - name: Comment on PR
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            let body;
+            try {
+              body = fs.readFileSync('results.md', 'utf8');
+            } catch (e) {
+              body = 'YARA-L validation did not produce a report (job likely failed before rule validation).';
+            }
+            const marker = '<!-- yara-l-validator-comment -->';
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            const prior = comments.find(c => c.body && c.body.includes(marker));
+            const fullBody = `${marker}\n${body}`;
+            if (prior) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: prior.id,
+                body: fullBody,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: fullBody,
+              });
+            }
+
+      - name: Fail job if validation failed
+        if: steps.validate.outcome != 'success'
+        run: exit 1

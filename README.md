@@ -58,7 +58,9 @@ Browser UI ──► FastAPI Server ──► Gemini (rule analysis + event gene
                     └──► Fixture Store (cached events for replay)
 ```
 
-UDM events are ingested via `events:import` directly — parsing is skipped entirely, so detections evaluate as soon as SecOps runs the next rule pass (usually under 60 seconds for LIVE frequency rules).
+UDM events are ingested via `events:import` directly. Parsing is skipped entirely, so detections evaluate as soon as SecOps runs the next rule pass (usually under 60 seconds for LIVE frequency rules).
+
+> **Parser-path disclosure.** Direct UDM ingest proves the rule's UDM conditions match a well-formed UDM payload. It does NOT prove that your production parser produces the UDM shape the rule expects. A rule validated here can still miss in production if the parser maps fields differently (for example `principal.user.userid` versus `principal.user.email_addresses`). Validate parser correctness separately via Chronicle's parser validator or by sampling real-data UDM records. See [docs/COVERAGE.md](docs/COVERAGE.md#ingestion-path) for the full list of what the validator does and does not cover.
 
 ## Tools (MCP)
 
@@ -188,6 +190,18 @@ Natural language in the right panel:
 > *"Run full validation on this rule and also check for false positives"*
 > *"Load the fixture for detect_lateral_movement and re-verify"*
 > *"Batch validate all 5 rules I just pasted"*
+
+### CI / PR validation
+
+For detection teams that keep YARA-L rules in Git, the `cli/` directory ships
+a `validate_changed.py` script and a GitHub Action template
+(`.github/workflows/validate-rules.yml`) that validates only the rules that
+changed in a PR and comments a pass/fail matrix. Composite rules are skipped
+because their validation takes up to 24 hours; run those in a nightly job.
+
+See [cli/README.md](cli/README.md) for setup (workload identity federation,
+required secrets, flag reference) and [docs/COVERAGE.md](docs/COVERAGE.md)
+for what YARA-L constructs the validator actually covers.
 
 ## What It Is Not
 
