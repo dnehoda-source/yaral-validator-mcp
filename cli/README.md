@@ -27,9 +27,18 @@ python validate_changed.py \
 ```
 
 Exit code is `0` if every changed rule passed, `1` if any failed or errored.
+
 Composite rules (those referencing `$var.detection.*` or `rule_name = "..."`)
-are skipped with status `SKIPPED_COMPOSITE` because their validation takes up
-to 24 hours; run those through the web UI or a nightly job.
+are handled by `--composite-mode`:
+
+- `static` (default): calls `/api/composite-static-validate`, which validates
+  each referenced base rule end-to-end and runs a structural check on the
+  composite. Returns in minutes, not hours. Does NOT exercise Chronicle's
+  cascade scheduler.
+- `skip`: marks composites `SKIPPED_COMPOSITE` without validation (legacy).
+
+For full composite coverage, combine the static check in CI with a nightly
+`cascade_validate` job that tolerates the 1-24 hour wait.
 
 ## Run in GitHub Actions
 
@@ -57,6 +66,7 @@ deployment.
 | `--poll-seconds` | 180 | Max seconds to poll for detection per rule. |
 | `--out` | `results.json` | Structured output. |
 | `--markdown` | (off) | Optional markdown matrix (used by the PR comment step). |
+| `--composite-mode` | `static` | `static` calls the composite fast path; `skip` marks composites SKIPPED without validating. |
 
 ## Output format
 

@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.env
+*.key
+metrics.json
+fixtures/*.json
+!fixtures/test_local_rule.json

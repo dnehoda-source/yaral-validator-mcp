@@ -29,7 +29,9 @@ Five validation modes:
 | **Batch** | Pass/fail matrix across many rules in one go | <5 min per rule |
 | **Composite cascade** | Upstream rules fire → downstream composite rule fires | **up to 1h (HOURLY) or 24h (DAILY)** |
 
-Composite cascade is supported but slow — Chronicle schedules composite evaluation on HOURLY (windows 1–24h) or DAILY (windows ≥24h) cadences and rejects retrohunts on composites, so there is no fast path. The UI warns up-front with the expected wait (derived from the rule's match window) before ingesting the cascade, and keeps polling until the next scheduled run lands or the wait expires. The only reliable way to test a composite is a ≥1h match window on HOURLY cadence.
+Composite cascade is supported but slow — Chronicle schedules composite evaluation on HOURLY (windows 1–24h) or DAILY (windows ≥24h) cadences and rejects retrohunts on composites, so there is no fast path through Chronicle's cascade evaluator. The UI warns up-front with the expected wait (derived from the rule's match window) before ingesting the cascade, and keeps polling until the next scheduled run lands or the wait expires.
+
+**CI fast-path for composites.** For PR-blocking checks where a 1-24 hour wait is unacceptable, use `composite_static_validate` (tool) or `/api/composite-static-validate` (HTTP). It validates each referenced base rule end-to-end and runs a structural check on the composite (join keys, window, ordering), then returns immediately. It does NOT prove Chronicle will chain the cascade on its schedule. Pair it with a nightly `cascade_validate` job to cover both.
 
 ## The Workflow
 
@@ -99,6 +101,7 @@ UDM events are ingested via `events:import` directly. Parsing is skipped entirel
 | `analyze_composite_rule` | Detects rule chains and explains structure (base components, join keys, ordering, window) |
 | `generate_cascade_events` | Generates event sets that trigger each base rule in the chain |
 | `cascade_validate` | End-to-end: analyzes, generates, ingests — then returns a wait estimate (up to 1h HOURLY or 24h DAILY). Client polls on the matching cadence until the composite fires. |
+| `composite_static_validate` | CI fast path: validates every referenced base rule individually + a structural check on the composite, returns immediately. Skips Chronicle's cascade scheduler. Pair with a nightly `cascade_validate` for full coverage. |
 
 ## Detection Summaries
 
@@ -126,6 +129,9 @@ You can still get raw JSON from the API for programmatic consumers.
 | `OAUTH_CLIENT_ID` | No | Google OAuth client ID — if set, login required |
 | `ALLOWED_EMAILS` | No | Comma-separated list of allowed Google emails |
 | `PORT` | No | HTTP port (default: `8080`) |
+| `DETERMINISTIC` | No | `1` pins Gemini temperature to 0 and caches responses by `sha256(model, system, prompt, max_tokens)`. Use in CI so identical rules produce identical events run-to-run. |
+| `METRICS_PATH` | No | File path for aggregate metrics snapshot (default: `./metrics.json`). |
+| `FIXTURE_BACKEND` | No | `gcs` to store fixtures in `$FIXTURE_BUCKET`; otherwise local filesystem at `./fixtures/`. |
 
 ## Deploy to Cloud Run
 

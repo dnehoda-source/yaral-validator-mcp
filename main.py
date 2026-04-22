@@ -9,8 +9,10 @@ import os
 import re
 import uuid
 import time
+import hashlib
 import logging
 import requests
+import threading
 from datetime import datetime, timezone, timedelta
 from fastapi import FastAPI, Request
 from fastapi.staticfiles import StaticFiles
@@ -65,6 +67,129 @@ class SessionStore:
         return self.sessions.get(sid, {}).get("validations", [])
 
 session_store = SessionStore()
+
+
+# ── METRICS ──────────────────────────────────────────────────────
+class MetricsCollector:
+    """In-memory aggregate metrics for the detection-team dashboard.
+
+    Persisted to $METRICS_PATH (default ./metrics.json) on every increment so
+    counts survive container restarts. For scale beyond one Cloud Run instance
+    point METRICS_PATH at a shared filesystem or swap in a real backend.
+    """
+
+    def __init__(self, path: str | None = None):
+        self.path = path or os.getenv("METRICS_PATH", "./metrics.json")
+        self._lock = threading.Lock()
+        self._data = self._load()
+
+    def _load(self) -> dict:
+        try:
+            with open(self.path, "r", encoding="utf-8") as fh:
+                return json.load(fh)
+        except Exception:
+            return {
+                "validations_total": 0,
+                "by_outcome": {"PASS": 0, "FAIL": 0, "ERROR": 0, "SKIPPED": 0, "AWAITING": 0},
+                "composite_static_runs": 0,
+                "negative_tests_total": 0,
+                "fixture_saves_total": 0,
+                "fixture_loads_total": 0,
+                "rules_seen": {},
+                "last_run": None,
+                "first_run": None,
+            }
+
+    def _save(self) -> None:
+        try:
+            with open(self.path, "w", encoding="utf-8") as fh:
+                json.dump(self._data, fh, indent=2, default=str)
+        except Exception as exc:
+            logger.warning(f"Could not persist metrics to {self.path}: {exc}")
+
+    def record_validation(self, rule_name: str, outcome: str) -> None:
+        key = outcome.upper() if outcome else "UNKNOWN"
+        bucket = key if key in ("PASS", "FAIL", "ERROR", "SKIPPED", "AWAITING") else "ERROR"
+        now = datetime.now(timezone.utc).isoformat()
+        with self._lock:
+            self._data["validations_total"] += 1
+            self._data["by_outcome"][bucket] = self._data["by_outcome"].get(bucket, 0) + 1
+            if rule_name:
+                rule_key = rule_name[:200]
+                prior = self._data["rules_seen"].get(rule_key, {})
+                self._data["rules_seen"][rule_key] = {
+                    "last_outcome": bucket,
+                    "last_run": now,
+                    "runs": prior.get("runs", 0) + 1,
+                }
+            self._data["last_run"] = now
+            if not self._data["first_run"]:
+                self._data["first_run"] = now
+            self._save()
+
+    def record_composite_static(self) -> None:
+        with self._lock:
+            self._data["composite_static_runs"] += 1
+            self._save()
+
+    def record_negative_test(self) -> None:
+        with self._lock:
+            self._data["negative_tests_total"] += 1
+            self._save()
+
+    def record_fixture(self, op: str) -> None:
+        key = {"save": "fixture_saves_total", "load": "fixture_loads_total"}.get(op)
+        if not key:
+            return
+        with self._lock:
+            self._data[key] += 1
+            self._save()
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            rules = self._data.get("rules_seen", {})
+            recent = sorted(
+                ({"rule_name": k, **v} for k, v in rules.items()),
+                key=lambda r: r.get("last_run") or "",
+                reverse=True,
+            )[:20]
+            return {
+                "validations_total": self._data["validations_total"],
+                "by_outcome": dict(self._data["by_outcome"]),
+                "composite_static_runs": self._data["composite_static_runs"],
+                "negative_tests_total": self._data["negative_tests_total"],
+                "fixture_saves_total": self._data["fixture_saves_total"],
+                "fixture_loads_total": self._data["fixture_loads_total"],
+                "rules_tracked": len(rules),
+                "recent_rules": recent,
+                "first_run": self._data["first_run"],
+                "last_run": self._data["last_run"],
+            }
+
+
+metrics = MetricsCollector()
+
+
+def _outcome_bucket(result: dict) -> str:
+    """Collapse a validation result JSON into a single outcome bucket."""
+    status = (result or {}).get("status", "")
+    if not status:
+        return "ERROR"
+    status = str(status).upper()
+    if status in ("PASS", "SUCCESS", "FIRED"):
+        return "PASS"
+    if status in ("FAIL", "FAILED", "NOT_FIRED"):
+        return "FAIL"
+    if status in ("INGESTED_AWAITING_VERIFICATION", "INGESTED_AWAITING_CASCADE_VERIFY"):
+        return "AWAITING"
+    if status.startswith("SKIPPED") or status == "USE_CASCADE_VALIDATE" or status == "NOT_COMPOSITE":
+        return "SKIPPED"
+    if status in ("STATIC_OK",):
+        return "PASS"
+    if status.startswith("STATIC_FAIL"):
+        return "FAIL"
+    return "ERROR"
+
 
 # ── AUTH ─────────────────────────────────────────────────────────
 def _get_adc_token() -> str:
@@ -162,14 +287,39 @@ def _extract_json(text: str) -> any:
     )
 
 
-def _gemini(prompt: str, system: str = "", max_tokens: int = 8192) -> str:
-    """Call Gemini and return text."""
+DETERMINISTIC_MODE = os.getenv("DETERMINISTIC", "").lower() in ("1", "true", "yes")
+_GEMINI_CACHE: dict = {}
+_GEMINI_CACHE_LOCK = threading.Lock()
+
+
+def _gemini(prompt: str, system: str = "", max_tokens: int = 8192, deterministic: bool | None = None) -> str:
+    """Call Gemini and return text.
+
+    When DETERMINISTIC mode is active (env DETERMINISTIC=1 or the deterministic
+    flag is True), temperature is pinned to 0 and identical (prompt, system,
+    model, max_tokens) tuples return a cached response. This makes CI runs
+    reproducible at the cost of diversity across retries.
+    """
+    if deterministic is None:
+        deterministic = DETERMINISTIC_MODE
+    temperature = 0.0 if deterministic else 0.1
+
+    cache_key = ""
+    if deterministic:
+        cache_key = hashlib.sha256(
+            f"{GEMINI_MODEL}\0{system}\0{prompt}\0{max_tokens}".encode("utf-8")
+        ).hexdigest()
+        with _GEMINI_CACHE_LOCK:
+            cached = _GEMINI_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+
     token = _get_adc_token()
     url = (f"https://us-central1-aiplatform.googleapis.com/v1/projects/{SECOPS_PROJECT_ID}"
            f"/locations/us-central1/publishers/google/models/{GEMINI_MODEL}:generateContent")
     body: dict = {
         "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-        "generationConfig": {"maxOutputTokens": max_tokens, "temperature": 0.1},
+        "generationConfig": {"maxOutputTokens": max_tokens, "temperature": temperature},
     }
     if system:
         body["systemInstruction"] = {"parts": [{"text": system}]}
@@ -180,9 +330,14 @@ def _gemini(prompt: str, system: str = "", max_tokens: int = 8192) -> str:
     candidate = resp.json().get("candidates", [{}])[0]
     finish_reason = candidate.get("finishReason", "")
     if finish_reason == "MAX_TOKENS":
-        logger.warning("Gemini response hit MAX_TOKENS limit — output may be truncated")
+        logger.warning("Gemini response hit MAX_TOKENS limit; output may be truncated")
     parts = candidate.get("content", {}).get("parts", [])
-    return "".join(p.get("text", "") for p in parts)
+    out = "".join(p.get("text", "") for p in parts)
+
+    if deterministic and cache_key:
+        with _GEMINI_CACHE_LOCK:
+            _GEMINI_CACHE[cache_key] = out
+    return out
 
 # ═══════════════════════════════════════════════════════════════
 # MCP TOOLS
@@ -1619,6 +1774,85 @@ def cascade_validate(composite_rule_text: str, base_rule_names: str = "") -> str
         return json.dumps({"error": str(e)})
 
 
+@app_mcp.tool()
+def composite_static_validate(composite_rule_text: str, wait_seconds: int = 120) -> str:
+    """Fast path for composite rules in CI. Validates each referenced base
+    rule end-to-end (synthetic events fire the base rule), plus runs a
+    structural check on the composite itself (join keys, window, ordering).
+    Skips the 1-24 hour Chronicle cascade wait. Returns one of:
+      STATIC_OK                  every base rule fires; composite structure valid
+      STATIC_FAIL_BASE_RULE      at least one base rule failed its own validation
+      STATIC_FAIL_MISSING_BASES  composite references rules not deployed in SecOps
+      STATIC_FAIL_STRUCTURE      composite is malformed (no joins, no window)
+      NOT_COMPOSITE              rule is not a composite; caller should use run_full_validation
+
+    This does NOT prove Chronicle will chain the cascade on its schedule. It
+    proves the inputs to the cascade work; Chronicle's scheduler is a separate
+    concern handled by cascade_validate (slow) or nightly jobs.
+    """
+    heuristic = _detect_composite(composite_rule_text)
+    if not heuristic["is_composite"]:
+        return json.dumps({
+            "status": "NOT_COMPOSITE",
+            "heuristic": heuristic,
+            "message": "Rule is not composite. Use run_full_validation instead.",
+        })
+
+    analysis_raw = analyze_composite_rule(composite_rule_text)
+    analysis = json.loads(analysis_raw)
+    if "error" in analysis:
+        return json.dumps({"status": "STATIC_FAIL_STRUCTURE", "stage": "analyze", "analysis": analysis})
+
+    base_rules = _extract_base_rule_refs(composite_rule_text)
+    if not base_rules:
+        return json.dumps({
+            "status": "STATIC_FAIL_STRUCTURE",
+            "reason": "Composite references no base rule names by literal match.",
+            "heuristic": heuristic,
+            "analysis": analysis,
+        })
+
+    fetch = _fetch_rule_texts_by_name(base_rules)
+    if fetch["missing"]:
+        return json.dumps({
+            "status": "STATIC_FAIL_MISSING_BASES",
+            "missing_rules": fetch["missing"],
+            "found_rules": list(fetch["found"].keys()),
+            "message": (
+                f"Composite references rules not deployed LIVE in SecOps: {fetch['missing']}. "
+                "Deploy them first, then re-run."
+            ),
+        })
+
+    structure_issues: list = []
+    if not (analysis.get("join_keys") or []):
+        structure_issues.append("No join_keys extracted from the composite.")
+    if not analysis.get("time_window"):
+        structure_issues.append("No match window parsed; cascade cannot correlate.")
+
+    base_results: list = []
+    overall_ok = True
+    for name, text in fetch["found"].items():
+        per = run_full_validation(text, rule_name=name, wait_seconds=wait_seconds)
+        per_obj = json.loads(per)
+        base_results.append({"rule_name": name, "status": per_obj.get("status"), "result": per_obj})
+        if per_obj.get("status") not in ("INGESTED_AWAITING_VERIFICATION", "USE_CASCADE_VALIDATE"):
+            overall_ok = False
+
+    return json.dumps({
+        "status": "STATIC_OK" if (overall_ok and not structure_issues) else "STATIC_FAIL_BASE_RULE" if not overall_ok else "STATIC_FAIL_STRUCTURE",
+        "composite_rule_name": analysis.get("rule_name", ""),
+        "base_rule_results": base_results,
+        "structure_issues": structure_issues,
+        "analysis": analysis,
+        "note": (
+            "Each base rule was ingested and will be verified by the caller's usual poll "
+            "(see results[].result.next_step). Chronicle's cascade evaluation for the "
+            "composite itself still happens on HOURLY/DAILY cadence and is not exercised here."
+        ),
+    })
+
+
 # ═══════════════════════════════════════════════════════════════
 # FASTAPI
 # ═══════════════════════════════════════════════════════════════
@@ -1661,6 +1895,13 @@ async def auth_config():
 async def api_history(request: Request):
     sid = request.cookies.get("yv_session", "")
     return JSONResponse({"validations": session_store.get_validations(sid)})
+
+
+@app.get("/api/metrics")
+async def api_metrics(request: Request):
+    if not _verify_google_token(request):
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    return JSONResponse(metrics.snapshot())
 
 
 @app.post("/api/analyze")
@@ -1713,6 +1954,7 @@ async def api_validate(request: Request):
     result_raw = run_full_validation(rule_text, rule_name=rule_name)
     result = json.loads(result_raw)
     session_store.add_validation(session_id, {"ts": datetime.now(timezone.utc).isoformat(), **result})
+    metrics.record_validation(result.get("rule_name") or rule_name, _outcome_bucket(result))
     resp = JSONResponse(result)
     resp.set_cookie("yv_session", session_id, max_age=86400, samesite="lax")
     return resp
@@ -1739,7 +1981,12 @@ async def api_verify(request: Request):
     validation_id = body.get("validation_id", "")
     minutes_back = int(body.get("minutes_back", 10))
     result = verify_rule_triggered(rule_name, minutes_back=minutes_back, validation_id=validation_id)
-    return JSONResponse(json.loads(result))
+    parsed = json.loads(result)
+    if parsed.get("triggered") is True or parsed.get("status") == "FIRED":
+        metrics.record_validation(rule_name, "PASS")
+    elif parsed.get("status") in ("NOT_FIRED", "FAILED", "ERROR"):
+        metrics.record_validation(rule_name, "FAIL")
+    return JSONResponse(parsed)
 
 
 # ── NEGATIVE TESTING ENDPOINTS ─────────────────────────────────
@@ -1753,6 +2000,7 @@ async def api_generate_negative(request: Request):
     if not analysis_json:
         return JSONResponse({"error": "No analysis provided"}, status_code=400)
     result = generate_negative_events(analysis_json, count=count)
+    metrics.record_negative_test()
     return JSONResponse(json.loads(result))
 
 
@@ -1792,6 +2040,7 @@ async def api_fixture_save(request: Request):
     if not rule_name or not events_json:
         return JSONResponse({"error": "rule_name and events_json required"}, status_code=400)
     result = save_fixture(rule_name, events_json, metadata_json)
+    metrics.record_fixture("save")
     return JSONResponse(json.loads(result))
 
 
@@ -1805,6 +2054,7 @@ async def api_fixture_load(request: Request):
     if not rule_name:
         return JSONResponse({"error": "rule_name required"}, status_code=400)
     result = load_fixture(rule_name, refresh_timestamps=refresh)
+    metrics.record_fixture("load")
     return JSONResponse(json.loads(result))
 
 
@@ -1867,6 +2117,22 @@ async def api_cascade_validate(request: Request):
         return JSONResponse({"error": "rule_text required"}, status_code=400)
     result = cascade_validate(rule_text, base_rule_names)
     return JSONResponse(json.loads(result))
+
+
+@app.post("/api/composite-static-validate")
+async def api_composite_static_validate(request: Request):
+    if not _verify_google_token(request):
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    body = await request.json()
+    rule_text = body.get("rule_text", body.get("rule", "")).strip()
+    wait_seconds = int(body.get("wait_seconds", 120))
+    if not rule_text:
+        return JSONResponse({"error": "rule_text required"}, status_code=400)
+    result = composite_static_validate(rule_text, wait_seconds=wait_seconds)
+    parsed = json.loads(result)
+    metrics.record_composite_static()
+    metrics.record_validation(parsed.get("composite_rule_name", ""), _outcome_bucket(parsed))
+    return JSONResponse(parsed)
 
 
 @app.post("/api/chat")

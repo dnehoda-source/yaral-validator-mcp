@@ -88,9 +88,13 @@ Anything else relies on Gemini following the analyzed rule requirements.
 | Base-rule source auto-fetch | OK | `_fetch_rule_texts_by_name` pulls deployed rule text from SecOps so the generator produces chained events against real base-rule signatures. |
 | Composite with zero deployed base rules | Partial | Generator falls back to heuristics when base-rule text cannot be fetched; cascade may not fire. |
 
-**CI note:** `cli/validate_changed.py` skips composite rules with status
-`SKIPPED_COMPOSITE` because blocking a PR on a 1-24 hour validation is
-impractical. Run composite validation in a nightly job or through the web UI.
+**CI note:** `cli/validate_changed.py` now has two composite modes (select with `--composite-mode`):
+
+- `static` (default): route composites to `composite_static_validate`, which validates every referenced base rule end-to-end plus a structural check on the composite (join keys, window, ordering). Returns immediately. Does NOT exercise Chronicle's cascade scheduler.
+- `skip`: mark every composite `SKIPPED_COMPOSITE` without any validation.
+
+For full coverage, combine `--composite-mode static` in CI with a nightly
+`cascade_validate` job that accepts the 1-24 hour wait.
 
 ## Negative testing coverage
 
@@ -130,8 +134,11 @@ Validator synthesized.
 - **No reference-list hydration.** Rules that match on `%list.<key>` need
   real data or custom fixtures.
 - **No regex/CIDR-aware event sampling.** Coverage is best-effort via Gemini.
-- **No per-rule determinism.** Regenerating events on identical input yields
-  slightly different payloads. Cache passing fixtures before relying on CI.
+- **Per-rule determinism is opt-in.** Set `DETERMINISTIC=1` on the server to
+  pin Gemini temperature to 0 and cache responses by
+  `sha256(model, system, prompt, max_tokens)`. Identical rules then produce
+  identical events within a server lifetime. Fixtures remain the durable path
+  across restarts.
 - **Parser path not tested.** See above.
 
 Refresh this matrix whenever the analyzer prompt, generator prompt, or

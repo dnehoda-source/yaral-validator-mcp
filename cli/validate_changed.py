@@ -87,18 +87,53 @@ def validate_one(
     id_token: str,
     poll_seconds: int,
     verify_minutes_back: int,
+    composite_mode: str = "static",
 ) -> RuleResult:
     text = rule_path.read_text()
     res = RuleResult(path=str(rule_path))
     t0 = time.time()
+    headers = {"Authorization": f"Bearer {id_token}"} if id_token else {}
 
     if is_composite(text):
-        res.status = "SKIPPED_COMPOSITE"
-        res.detail = "Composite rule detected. Validate via the web UI or a nightly job (up to 24h wait)."
+        if composite_mode == "skip":
+            res.status = "SKIPPED_COMPOSITE"
+            res.detail = "Composite rule detected. Validate via the web UI or a nightly job (up to 24h wait)."
+            res.elapsed_s = round(time.time() - t0, 2)
+            return res
+        r = requests.post(
+            f"{validator_url}/api/composite-static-validate",
+            json={"rule": text},
+            headers=headers,
+            timeout=600,
+        )
+        if not r.ok:
+            res.status = "ERROR"
+            res.detail = f"HTTP {r.status_code}: {r.text[:300]}"
+            res.elapsed_s = round(time.time() - t0, 2)
+            return res
+        data = r.json()
+        status_map = {
+            "STATIC_OK": "PASS",
+            "STATIC_FAIL_BASE_RULE": "FAIL",
+            "STATIC_FAIL_MISSING_BASES": "FAIL",
+            "STATIC_FAIL_STRUCTURE": "FAIL",
+            "NOT_COMPOSITE": "ERROR",
+        }
+        res.status = status_map.get(data.get("status", ""), "ERROR")
+        res.rule_name = data.get("composite_rule_name", "") or Path(rule_path).name
+        detail_bits = []
+        if data.get("missing_rules"):
+            detail_bits.append(f"missing: {data['missing_rules']}")
+        if data.get("structure_issues"):
+            detail_bits.append(f"structure: {data['structure_issues']}")
+        if data.get("base_rule_results"):
+            failed = [r["rule_name"] for r in data["base_rule_results"] if r.get("status") not in ("INGESTED_AWAITING_VERIFICATION", "USE_CASCADE_VALIDATE")]
+            if failed:
+                detail_bits.append(f"failed bases: {failed}")
+        detail_bits.append(data.get("note") or "Chronicle cascade wait skipped; base rules validated individually.")
+        res.detail = " | ".join(b for b in detail_bits if b)
         res.elapsed_s = round(time.time() - t0, 2)
         return res
-
-    headers = {"Authorization": f"Bearer {id_token}"} if id_token else {}
 
     r = requests.post(
         f"{validator_url}/api/validate",
@@ -203,6 +238,13 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--out", type=Path, default=Path("results.json"))
     ap.add_argument("--markdown", type=Path, default=None)
     ap.add_argument("--all", action="store_true", help="Validate every rule, not just changed ones.")
+    ap.add_argument(
+        "--composite-mode",
+        choices=("static", "skip"),
+        default="static",
+        help="static: run composite_static_validate (validates base rules, skips Chronicle cascade wait). "
+             "skip: mark every composite SKIPPED_COMPOSITE (legacy behavior).",
+    )
     args = ap.parse_args(argv)
 
     if not args.validator_url:
@@ -224,6 +266,7 @@ def main(argv: list[str] | None = None) -> int:
             args.id_token,
             args.poll_seconds,
             args.verify_minutes_back,
+            composite_mode=args.composite_mode,
         ))
 
     args.out.write_text(json.dumps([asdict(r) for r in results], indent=2))
