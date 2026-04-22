@@ -88,6 +88,8 @@ def validate_one(
     poll_seconds: int,
     verify_minutes_back: int,
     composite_mode: str = "static",
+    validation_mode: str = "udm_direct",
+    log_type: str = "",
 ) -> RuleResult:
     text = rule_path.read_text()
     res = RuleResult(path=str(rule_path))
@@ -135,11 +137,14 @@ def validate_one(
         res.elapsed_s = round(time.time() - t0, 2)
         return res
 
+    payload = {"rule": text, "validation_mode": validation_mode}
+    if log_type:
+        payload["log_type"] = log_type
     r = requests.post(
         f"{validator_url}/api/validate",
-        json={"rule": text},
+        json=payload,
         headers=headers,
-        timeout=180,
+        timeout=240,
     )
     if r.status_code == 401:
         res.status = "UNAUTHORIZED"
@@ -245,7 +250,25 @@ def main(argv: list[str] | None = None) -> int:
         help="static: run composite_static_validate (validates base rules, skips Chronicle cascade wait). "
              "skip: mark every composite SKIPPED_COMPOSITE (legacy behavior).",
     )
+    ap.add_argument(
+        "--validation-mode",
+        choices=("udm_direct", "parser_path", "both"),
+        default="udm_direct",
+        help="udm_direct (default, fast): synthetic UDM, parser bypassed. "
+             "parser_path (slow): raw native logs through the parser; requires --log-type. "
+             "both: run both and return combined verdict.",
+    )
+    ap.add_argument(
+        "--log-type",
+        default="",
+        help="Chronicle log type when --validation-mode is parser_path or both "
+             "(e.g. WINEVTLOG, OKTA, GCP_CLOUDAUDIT).",
+    )
     args = ap.parse_args(argv)
+
+    if args.validation_mode in ("parser_path", "both") and not args.log_type:
+        print(f"error: --log-type is required when --validation-mode is {args.validation_mode}", file=sys.stderr)
+        return 2
 
     if not args.validator_url:
         print("error: --validator-url or VALIDATOR_URL env is required", file=sys.stderr)
@@ -267,6 +290,8 @@ def main(argv: list[str] | None = None) -> int:
             args.poll_seconds,
             args.verify_minutes_back,
             composite_mode=args.composite_mode,
+            validation_mode=args.validation_mode,
+            log_type=args.log_type,
         ))
 
     args.out.write_text(json.dumps([asdict(r) for r in results], indent=2))

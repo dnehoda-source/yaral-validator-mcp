@@ -67,6 +67,8 @@ deployment.
 | `--out` | `results.json` | Structured output. |
 | `--markdown` | (off) | Optional markdown matrix (used by the PR comment step). |
 | `--composite-mode` | `static` | `static` calls the composite fast path; `skip` marks composites SKIPPED without validating. |
+| `--validation-mode` | `udm_direct` | `udm_direct` (fast, parser bypassed), `parser_path` (raw logs through parser), `both` (gate on both). |
+| `--log-type` | (empty) | Chronicle log type for `parser_path` / `both` (e.g. `WINEVTLOG`, `OKTA`, `GCP_CLOUDAUDIT`). |
 
 ## Output format
 

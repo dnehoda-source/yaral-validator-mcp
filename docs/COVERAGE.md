@@ -115,17 +115,46 @@ fixture.
 
 ## Ingestion path
 
-The Validator uses `events:import` (UDM direct), not the parser path.
+The Validator supports two ingestion paths, selectable per validation
+(UI dropdown, `--validation-mode` flag, or `validation_mode` parameter).
 
-- **What this proves:** the rule's UDM conditions match a well-formed UDM event.
-- **What this does NOT prove:** that your production parser produces the UDM
-  shape the rule expects. A rule validated here can still fail in production
-  if the parser maps fields differently (e.g. `principal.user.userid` vs
+### udm_direct (default, fast)
+
+Uses `ingest_log(log_type=UDM)` so Chronicle's parser is skipped entirely.
+
+- **Speed:** 60-120s to verdict.
+- **Proves:** the rule's UDM conditions match a well-formed UDM event.
+- **Does NOT prove:** your production parser produces the UDM shape the rule
+  expects. A rule validated here can still fail in production if the parser
+  maps fields differently (e.g. `principal.user.userid` vs
   `principal.user.email_addresses`).
 
-Validate parser correctness separately via Chronicle's parser validator or by
-sampling real-data UDM records and comparing their shape to the events the
-Validator synthesized.
+### parser_path (slow, full-pipeline)
+
+Generates raw native logs in the source format (Windows Event Log XML, Okta
+JSON, GCP Cloud Audit JSON, Sysmon, CrowdStrike, CISCO_ASA, LINUX_SYSLOG,
+O365, AWS_CLOUDTRAIL, Azure AD) and calls `ingest_log(log_type=<specific>)`.
+
+- **Speed:** parser latency 30s-5min plus rule eval; budget 5+ minutes.
+- **Proves:** the full ingest path. Parser converts native payload to UDM;
+  rule evaluates against the parsed result. Catches parser-vs-rule mismatches
+  the udm_direct path cannot see.
+- **Requires:** `log_type` parameter (any Chronicle-supported type works;
+  `KNOWN_PARSER_LOG_TYPES` in `main.py` has Gemini hints for common ones).
+  Logs that fall outside those 10 types still work but the generator falls
+  back to a generic native-format prompt, so expect lower fidelity until a
+  hint is added.
+
+### both
+
+Runs udm_direct first, then parser_path. Returns both verdicts so the caller
+can gate on either. Use for release-grade validation of critical rules.
+
+### Caveat
+
+Parser path validates against whatever parser is currently deployed to your
+SecOps tenant. If you edit the parser, invalidate any cached fixtures or
+re-run.
 
 ## Gaps we know about
 

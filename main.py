@@ -717,6 +717,136 @@ def _sanitize_udm_event(e: dict) -> dict:
     return e
 
 
+# ═══════════════════════════════════════════════════════════════
+# PARSER-PATH VALIDATION (raw logs through Chronicle parser)
+# ═══════════════════════════════════════════════════════════════
+
+# Log types the generator knows how to produce without extra fixtures.
+# Expand as needed; Chronicle supports hundreds more via ingest_log.
+KNOWN_PARSER_LOG_TYPES = {
+    "WINEVTLOG": "Windows Event Log (XML). Use EventID 4624/4625 for logon, 4688 for process creation, 4663 for object access.",
+    "WINDOWS_SYSMON": "Sysmon event log (XML). EventID 1 process create, 3 network connect, 7 image load, 11 file create.",
+    "OKTA": "Okta system log (JSON). eventType like 'user.session.start', outcome.result.",
+    "GCP_CLOUDAUDIT": "GCP Cloud Audit Log (JSON with protoPayload, authenticationInfo, methodName).",
+    "AZURE_AD": "Azure AD sign-in / audit log (JSON with userPrincipalName, ipAddress, status.errorCode).",
+    "CROWDSTRIKE_FALCON": "CrowdStrike Falcon detection JSON (ExternalApiType, DetectDescription, ComputerName).",
+    "CISCO_ASA": "Cisco ASA syslog (%ASA-X-NNNNNN: ...).",
+    "LINUX_SYSLOG": "Generic RFC5424 syslog.",
+    "O365": "Microsoft 365 unified audit log (JSON with Operation, UserId, ClientIP).",
+    "AWS_CLOUDTRAIL": "AWS CloudTrail (JSON with eventName, userIdentity, sourceIPAddress).",
+}
+
+
+@app_mcp.tool()
+def generate_native_log_events(analysis_json: str, log_type: str, count: int = 5) -> str:
+    """Generate raw logs in a native format (not UDM) so Chronicle's parser
+    runs the full ingest path. Use this when you need to prove a rule fires
+    end-to-end including parser behavior, not just on a synthetic UDM payload.
+
+    log_type: Chronicle ingestion log type (e.g. WINEVTLOG, OKTA,
+    GCP_CLOUDAUDIT). See KNOWN_PARSER_LOG_TYPES for supported shapes.
+    Any Chronicle-supported log_type works; the generator asks Gemini for the
+    right native format for that source.
+
+    Returns {log_type, logs: [raw_log_strings], count}.
+    """
+    try:
+        analysis = json.loads(analysis_json) if isinstance(analysis_json, str) else analysis_json
+    except Exception:
+        analysis = {"trigger_summary": analysis_json}
+
+    min_needed = analysis.get("min_event_count", count)
+    actual_count = max(count, min_needed)
+    hint = KNOWN_PARSER_LOG_TYPES.get(log_type.upper(), f"Chronicle log type {log_type}. Produce a valid native log for this source.")
+    now = datetime.now(timezone.utc)
+    timestamps = [(now + timedelta(minutes=i)).strftime('%Y-%m-%dT%H:%M:%S.000Z') for i in range(actual_count)]
+
+    prompt = f"""Generate {actual_count} RAW LOG ENTRIES in the NATIVE format for Chronicle log_type {log_type}.
+
+{hint}
+
+These logs MUST satisfy the YARA-L rule analysis below when Chronicle's built-in
+parser converts them to UDM. Do NOT produce UDM. Produce the native source format
+(XML for Windows Event Log, JSON for cloud audit logs, syslog strings for network
+devices, etc.).
+
+Use THESE exact timestamps for the events (spread across a 10-minute window):
+{json.dumps(timestamps)}
+
+Rule analysis:
+{json.dumps(analysis, indent=2)}
+
+Event breakdown needed: {json.dumps(analysis.get("event_breakdown", {})) or "see condition block"}
+
+Return ONLY this JSON shape, no markdown, no commentary:
+{{
+  "logs": [
+    "<raw log string 1>",
+    "<raw log string 2>",
+    ...{actual_count - 1} more...
+  ]
+}}
+
+For multi-line native formats (Windows Event Log XML), keep each log as one
+JSON string with \\n line breaks preserved. For JSON-native formats (Okta,
+GCP audit, CloudTrail), each log is a stringified JSON object."""
+
+    try:
+        result = _gemini(prompt, max_tokens=8192)
+        parsed = _extract_json(result)
+        if not isinstance(parsed, dict) or "logs" not in parsed:
+            return json.dumps({"error": f"Generator returned unexpected format: {str(result)[:300]}"})
+        logs = parsed["logs"] if isinstance(parsed["logs"], list) else [parsed["logs"]]
+        return json.dumps({
+            "log_type": log_type.upper(),
+            "logs": logs,
+            "count": len(logs),
+            "note": "Raw native logs. Ingest via ingest_native_logs; parser runs; rule evaluates against parsed UDM.",
+        })
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+@app_mcp.tool()
+def ingest_native_logs(logs_json: str, log_type: str) -> str:
+    """Ingest raw native-format logs through Chronicle's parser path.
+    Expects the output of generate_native_log_events ({log_type, logs: [...]}).
+
+    Parser latency is typically 30 seconds to 5 minutes depending on the log
+    source. Use verify_rule_triggered with a longer minutes_back window.
+    """
+    try:
+        data = json.loads(logs_json) if isinstance(logs_json, str) else logs_json
+        logs = data.get("logs") if isinstance(data, dict) else data
+        if not logs:
+            return json.dumps({"error": "No logs to ingest"})
+        if not isinstance(logs, list):
+            logs = [logs]
+
+        from secops import SecOpsClient
+        client = SecOpsClient().chronicle(
+            customer_id=SECOPS_CUSTOMER_ID,
+            project_id=SECOPS_PROJECT_ID,
+            region=SECOPS_REGION,
+        )
+        validation_id = f"yaral-test-{uuid.uuid4().hex[:12]}"
+        ingestion_time = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+
+        result = client.ingest_log(log_type=log_type.upper(), logs=logs)
+        return json.dumps({
+            "status": "ingested",
+            "validation_id": validation_id,
+            "method": "ingest_log",
+            "log_type": log_type.upper(),
+            "event_count": len(logs),
+            "ingestion_time": ingestion_time,
+            "api_response": result,
+            "message": f"Ingested {len(logs)} raw {log_type.upper()} logs. Chronicle parser will convert to UDM. Expect 30s-5min before detection.",
+        })
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
 @app_mcp.tool()
 def ingest_synthetic_events(events_json: str) -> str:
     """Ingest synthetic UDM events directly into SecOps via events:import (no parser delay).
@@ -1027,17 +1157,32 @@ def verify_rule_triggered(rule_name: str, minutes_back: int = 10, validation_id:
 
 
 @app_mcp.tool()
-def run_full_validation(rule_text: str, rule_name: str = "", wait_seconds: int = 120) -> str:
-    """End-to-end YARA-L rule validation pipeline:
-    1. Analyze the rule to extract trigger conditions
-    2. Generate synthetic UDM events that satisfy those conditions
-    3. Ingest events into Chronicle
-    4. Wait for rule evaluation
-    5. Verify the rule fired
-    Returns a full validation report with pass/fail verdict."""
-    results = {}
+def run_full_validation(
+    rule_text: str,
+    rule_name: str = "",
+    wait_seconds: int = 120,
+    validation_mode: str = "udm_direct",
+    log_type: str = "",
+) -> str:
+    """End-to-end YARA-L rule validation.
+
+    validation_mode:
+      udm_direct  (default) Generate synthetic UDM events, ingest directly
+                  via events:import, skip the parser. Fast (~60-120s). Proves
+                  the rule's UDM conditions match a well-formed payload.
+                  Does NOT exercise Chronicle's parser.
+      parser_path Generate raw native logs (Windows Event XML, Okta JSON,
+                  GCP Cloud Audit JSON, etc.) and ingest via ingest_log so
+                  Chronicle's parser runs. Slow (parser latency ~30s-5min
+                  plus rule eval). Proves the full ingest path. Requires
+                  log_type (e.g. WINEVTLOG, OKTA, GCP_CLOUDAUDIT).
+      both        Run udm_direct first, then parser_path. Returns both
+                  verdicts so the caller can gate on either or both.
+
+    log_type: required when validation_mode is parser_path or both.
+    """
+    results: dict = {"validation_mode": validation_mode}
     try:
-        # Composite rules route to the cascade flow — this single-rule pipeline doesn't fit.
         comp = _detect_composite(rule_text)
         if comp["is_composite"]:
             return json.dumps({
@@ -1045,10 +1190,15 @@ def run_full_validation(rule_text: str, rule_name: str = "", wait_seconds: int =
                 "is_composite": True,
                 "heuristic": comp,
                 "message": _COMPOSITE_WARNING,
-                "next_step": "Use cascade_validate (or the 'Composite Validate' button in the UI) instead of run_full_validation. Composite validation is supported but takes up to 1-24 hours depending on match window.",
+                "next_step": "Use cascade_validate (or the 'Composite Validate' button) or composite_static_validate for CI.",
             })
 
-        # Step 1: Analyze
+        mode = (validation_mode or "udm_direct").lower()
+        if mode not in ("udm_direct", "parser_path", "both"):
+            return json.dumps({"status": "ERROR", "error": f"Unknown validation_mode '{validation_mode}'. Use udm_direct, parser_path, or both."})
+        if mode in ("parser_path", "both") and not log_type:
+            return json.dumps({"status": "ERROR", "error": "log_type is required when validation_mode is parser_path or both (e.g. WINEVTLOG, OKTA, GCP_CLOUDAUDIT)."})
+
         logger.info("Step 1: Analyzing YARA-L rule...")
         analysis_raw = analyze_yara_l_rule(rule_text)
         analysis = json.loads(analysis_raw)
@@ -1056,38 +1206,68 @@ def run_full_validation(rule_text: str, rule_name: str = "", wait_seconds: int =
         detected_name = analysis.get("rule_name", rule_name or "unknown_rule")
         if not rule_name:
             rule_name = detected_name
-
-        # Step 2: Generate events
-        logger.info("Step 2: Generating synthetic events...")
         min_count = analysis.get("min_event_count", 5)
-        events_raw = generate_synthetic_events(analysis_raw, count=max(5, min_count))
-        events_data = json.loads(events_raw)
-        results["generation"] = events_data
-        if "error" in events_data:
-            return json.dumps({"status": "FAILED", "stage": "generation", "results": results})
 
-        # Step 3: Ingest
-        logger.info("Step 3: Ingesting events into Chronicle...")
-        ingest_raw = ingest_synthetic_events(events_raw)
-        ingest_data = json.loads(ingest_raw)
-        results["ingestion"] = ingest_data
-        validation_id = ingest_data.get("validation_id", "")
-        if ingest_data.get("status") not in ["ingested", "ingested_fallback"]:
-            return json.dumps({"status": "FAILED", "stage": "ingestion", "results": results})
+        udm_ingest: dict = {}
+        parser_ingest: dict = {}
 
-        # Step 4: Wait
-        logger.info(f"Step 4: Waiting {wait_seconds}s for Chronicle rule evaluation...")
-        results["wait"] = {"seconds": wait_seconds, "message": f"Waiting {wait_seconds}s for Chronicle to evaluate..."}
+        if mode in ("udm_direct", "both"):
+            logger.info("Generating synthetic UDM events...")
+            events_raw = generate_synthetic_events(analysis_raw, count=max(5, min_count))
+            events_data = json.loads(events_raw)
+            results["udm_generation"] = events_data
+            if "error" in events_data:
+                return json.dumps({"status": "FAILED", "stage": "udm_generation", "results": results})
+            logger.info("Ingesting UDM events (bypassing parser)...")
+            ingest_raw = ingest_synthetic_events(events_raw)
+            udm_ingest = json.loads(ingest_raw)
+            results["udm_ingestion"] = udm_ingest
+            if udm_ingest.get("status") not in ("ingested", "ingested_fallback"):
+                return json.dumps({"status": "FAILED", "stage": "udm_ingestion", "results": results})
 
-        # We can't block Cloud Run for 2 min, so return interim result with verification instructions
+        if mode in ("parser_path", "both"):
+            logger.info(f"Generating native {log_type} logs for parser path...")
+            native_raw = generate_native_log_events(analysis_raw, log_type=log_type, count=max(5, min_count))
+            native_data = json.loads(native_raw)
+            results["parser_generation"] = native_data
+            if "error" in native_data:
+                return json.dumps({"status": "FAILED", "stage": "parser_generation", "results": results})
+            logger.info(f"Ingesting {log_type} logs through the parser...")
+            ingest_raw = ingest_native_logs(native_raw, log_type=log_type)
+            parser_ingest = json.loads(ingest_raw)
+            results["parser_ingestion"] = parser_ingest
+            if parser_ingest.get("status") != "ingested":
+                return json.dumps({"status": "FAILED", "stage": "parser_ingestion", "results": results})
+
+        verify_targets = []
+        if udm_ingest:
+            verify_targets.append({
+                "label": "udm_direct",
+                "validation_id": udm_ingest.get("validation_id", ""),
+                "recommended_wait_s": wait_seconds,
+            })
+        if parser_ingest:
+            parser_wait = max(wait_seconds, 300)
+            verify_targets.append({
+                "label": "parser_path",
+                "validation_id": parser_ingest.get("validation_id", ""),
+                "recommended_wait_s": parser_wait,
+            })
+
         return json.dumps({
             "status": "INGESTED_AWAITING_VERIFICATION",
             "rule_name": rule_name,
-            "validation_id": validation_id,
-            "event_count": events_data.get("count", 0),
-            "next_step": f"Call verify_rule_triggered(rule_name='{rule_name}', validation_id='{validation_id}') in {wait_seconds//60}-{wait_seconds//60+3} minutes",
+            "validation_mode": mode,
+            "log_type": log_type.upper() if log_type else "",
+            "verify_targets": verify_targets,
+            "event_count": (udm_ingest.get("event_count") or 0) + (parser_ingest.get("event_count") or 0),
+            "validation_id": verify_targets[0]["validation_id"] if verify_targets else "",
+            "next_step": (
+                "Call verify_rule_triggered with each validation_id. "
+                "udm_direct is typically ready in 60-120s; parser_path needs 5+ minutes for parser + rule eval."
+            ),
             "results": results,
-            "ingestion_time": ingest_data.get("ingestion_time", ""),
+            "ingestion_time": (udm_ingest.get("ingestion_time") or parser_ingest.get("ingestion_time") or ""),
         })
     except Exception as e:
         results["error"] = str(e)
@@ -1941,6 +2121,33 @@ async def api_ingest(request: Request):
     return JSONResponse(json.loads(result))
 
 
+@app.post("/api/generate-native")
+async def api_generate_native(request: Request):
+    if not _verify_google_token(request):
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    body = await request.json()
+    analysis_json = body.get("analysis_json", "")
+    log_type = body.get("log_type", "").strip()
+    count = int(body.get("count", 5))
+    if not analysis_json or not log_type:
+        return JSONResponse({"error": "analysis_json and log_type required"}, status_code=400)
+    result = generate_native_log_events(analysis_json, log_type=log_type, count=count)
+    return JSONResponse(json.loads(result))
+
+
+@app.post("/api/ingest-native")
+async def api_ingest_native(request: Request):
+    if not _verify_google_token(request):
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    body = await request.json()
+    logs_json = body.get("logs_json", "")
+    log_type = body.get("log_type", "").strip()
+    if not logs_json or not log_type:
+        return JSONResponse({"error": "logs_json and log_type required"}, status_code=400)
+    result = ingest_native_logs(logs_json, log_type=log_type)
+    return JSONResponse(json.loads(result))
+
+
 @app.post("/api/validate")
 async def api_validate(request: Request):
     if not _verify_google_token(request):
@@ -1948,16 +2155,28 @@ async def api_validate(request: Request):
     body = await request.json()
     rule_text = body.get("rule", "").strip()
     rule_name = body.get("rule_name", "")
+    validation_mode = body.get("validation_mode", "udm_direct")
+    log_type = body.get("log_type", "")
     session_id = body.get("session_id") or request.cookies.get("yv_session") or str(uuid.uuid4())
     if not rule_text:
         return JSONResponse({"error": "No rule provided"}, status_code=400)
-    result_raw = run_full_validation(rule_text, rule_name=rule_name)
+    result_raw = run_full_validation(rule_text, rule_name=rule_name, validation_mode=validation_mode, log_type=log_type)
     result = json.loads(result_raw)
     session_store.add_validation(session_id, {"ts": datetime.now(timezone.utc).isoformat(), **result})
     metrics.record_validation(result.get("rule_name") or rule_name, _outcome_bucket(result))
     resp = JSONResponse(result)
     resp.set_cookie("yv_session", session_id, max_age=86400, samesite="lax")
     return resp
+
+
+@app.get("/api/log-types")
+async def api_log_types(request: Request):
+    if not _verify_google_token(request):
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    return JSONResponse({
+        "supported": [{"log_type": k, "description": v} for k, v in KNOWN_PARSER_LOG_TYPES.items()],
+        "note": "Any Chronicle-supported log_type works; those listed above have Gemini hints. Others fall back to a generic native-format prompt.",
+    })
 
 
 @app.post("/api/enable-rule")

@@ -274,6 +274,32 @@ rule detect_lateral_movement {
       </div>
       <button class="btn full" style="border-color:var(--accent3);color:var(--accent3)" onclick="runIngest()">📤 Ingest Synthetic Events</button>
       <button class="btn primary full" onclick="runFullValidation()">🚀 Full Validation Pipeline</button>
+      <div style="padding:4px 4px 0 4px;font-size:0.75rem;color:var(--muted)">
+        <label style="display:flex;align-items:center;gap:6px">
+          <span style="flex:1">Ingestion path</span>
+          <select id="validation-mode" onchange="onValidationModeChange()" style="flex:2;background:var(--bg);color:var(--accent2);border:1px solid var(--border);border-radius:4px;padding:3px 6px;font-size:0.72rem">
+            <option value="udm_direct">UDM direct (fast, parser bypassed)</option>
+            <option value="parser_path">Parser path (raw logs → parser → UDM)</option>
+            <option value="both">Both (gate on both)</option>
+          </select>
+        </label>
+        <label id="log-type-wrap" style="display:none;align-items:center;gap:6px;margin-top:4px">
+          <span style="flex:1">Log type</span>
+          <input id="log-type-input" list="log-type-hints" placeholder="e.g. WINEVTLOG" style="flex:2;background:var(--bg);color:var(--accent2);border:1px solid var(--border);border-radius:4px;padding:3px 6px;font-size:0.72rem"/>
+          <datalist id="log-type-hints">
+            <option value="WINEVTLOG"></option>
+            <option value="WINDOWS_SYSMON"></option>
+            <option value="OKTA"></option>
+            <option value="GCP_CLOUDAUDIT"></option>
+            <option value="AZURE_AD"></option>
+            <option value="CROWDSTRIKE_FALCON"></option>
+            <option value="CISCO_ASA"></option>
+            <option value="LINUX_SYSLOG"></option>
+            <option value="O365"></option>
+            <option value="AWS_CLOUDTRAIL"></option>
+          </datalist>
+        </label>
+      </div>
       <label style="display:flex;align-items:center;gap:6px;font-size:0.75rem;color:var(--muted);padding:0 4px">
         <input type="checkbox" id="run-negative-toggle"/>
         Also run negative tests (false-positive check)
@@ -414,6 +440,12 @@ async function bootAuth() {
 }
 
 // ── HELPERS ──────────────────────────────────────────────────────
+function onValidationModeChange() {
+  const mode = document.getElementById('validation-mode').value;
+  const wrap = document.getElementById('log-type-wrap');
+  wrap.style.display = (mode === 'udm_direct') ? 'none' : 'flex';
+}
+
 function clearEmpty() {
   document.getElementById('empty-state').style.display = 'none';
 }
@@ -651,7 +683,16 @@ async function runFullValidation() {
       }
     } catch(e) { if (e.message === 'Unauthorized') return; }
   }
-  if (!usedFixture) {
+  const validationMode = (document.getElementById('validation-mode') || {}).value || 'udm_direct';
+  const logType = (document.getElementById('log-type-input') || {}).value?.trim() || '';
+  if ((validationMode === 'parser_path' || validationMode === 'both') && !logType) {
+    finishPipeline('err', 'Select a log type (e.g. WINEVTLOG, OKTA) for parser-path validation.');
+    return;
+  }
+  const useUdm = validationMode === 'udm_direct' || validationMode === 'both';
+  const useParser = validationMode === 'parser_path' || validationMode === 'both';
+
+  if (!usedFixture && useUdm) {
     try {
       const minCount = lastAnalysis.min_event_count || 5;
       genData = await callApi('/api/generate', {analysis_json: JSON.stringify(lastAnalysis), count: minCount});
@@ -660,23 +701,52 @@ async function runFullValidation() {
       return;
     }
     if (genData.error) { finishPipeline('err', genData.error); return; }
-    addCard('⚡ Synthetic Events (' + (genData.count || (genData.events || []).length || 5) + ')',
+    addCard('⚡ Synthetic UDM Events (' + (genData.count || (genData.events || []).length || 5) + ')',
             JSON.stringify(genData, null, 2), 'DONE', 'ok');
   }
   lastGeneratedEvents = genData;
 
+  let nativeData = null;
+  if (useParser) {
+    try {
+      const minCount = lastAnalysis.min_event_count || 5;
+      nativeData = await callApi('/api/generate-native', {analysis_json: JSON.stringify(lastAnalysis), log_type: logType, count: minCount});
+    } catch(e) {
+      if (e.message !== 'Unauthorized') finishPipeline('err', 'Native generate failed: ' + e.message);
+      return;
+    }
+    if (nativeData.error) { finishPipeline('err', nativeData.error); return; }
+    addCard('⚡ Native ' + logType + ' Logs (' + (nativeData.count || 0) + ')',
+            JSON.stringify(nativeData, null, 2), 'DONE', 'ok');
+  }
+
   // ── Step 4: Ingest ───────────────────────────────────────────
   addPipeline('Ingest');
   await tick();
-  let ingestData;
-  try {
-    ingestData = await callApi('/api/ingest', {events_json: JSON.stringify(genData)});
-  } catch(e) {
-    if (e.message !== 'Unauthorized') finishPipeline('err', 'Ingest failed: ' + e.message);
-    return;
+  let ingestData = null;
+  if (useUdm) {
+    try {
+      ingestData = await callApi('/api/ingest', {events_json: JSON.stringify(genData)});
+    } catch(e) {
+      if (e.message !== 'Unauthorized') finishPipeline('err', 'Ingest failed: ' + e.message);
+      return;
+    }
+    if (ingestData.error) { finishPipeline('err', ingestData.error); return; }
+    addCard('📤 UDM Ingestion', JSON.stringify(ingestData, null, 2), 'DONE', 'ok');
   }
-  if (ingestData.error) { finishPipeline('err', ingestData.error); return; }
-  addCard('📤 Ingestion', JSON.stringify(ingestData, null, 2), 'DONE', 'ok');
+  let parserIngestData = null;
+  if (useParser) {
+    try {
+      parserIngestData = await callApi('/api/ingest-native', {logs_json: JSON.stringify(nativeData), log_type: logType});
+    } catch(e) {
+      if (e.message !== 'Unauthorized') finishPipeline('err', 'Parser ingest failed: ' + e.message);
+      return;
+    }
+    if (parserIngestData.error) { finishPipeline('err', parserIngestData.error); return; }
+    addCard('📤 Parser Ingestion (' + logType + ')', JSON.stringify(parserIngestData, null, 2), 'DONE', 'info');
+  }
+  // Default verify target: UDM path if present, parser path otherwise.
+  if (!ingestData) ingestData = parserIngestData;
 
   // ── Step 5: Verify — auto-poll every 30s for up to 6 min ────
   addPipeline('Verify');

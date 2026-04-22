@@ -62,7 +62,7 @@ Browser UI ──► FastAPI Server ──► Gemini (rule analysis + event gene
 
 UDM events are ingested via `events:import` directly. Parsing is skipped entirely, so detections evaluate as soon as SecOps runs the next rule pass (usually under 60 seconds for LIVE frequency rules).
 
-> **Parser-path disclosure.** Direct UDM ingest proves the rule's UDM conditions match a well-formed UDM payload. It does NOT prove that your production parser produces the UDM shape the rule expects. A rule validated here can still miss in production if the parser maps fields differently (for example `principal.user.userid` versus `principal.user.email_addresses`). Validate parser correctness separately via Chronicle's parser validator or by sampling real-data UDM records. See [docs/COVERAGE.md](docs/COVERAGE.md#ingestion-path) for the full list of what the validator does and does not cover.
+> **Two ingestion paths.** UDM direct is fast (60-120s) and proves the rule's UDM conditions match a well-formed payload. It does NOT prove your production parser produces the expected UDM shape. Parser path (new) generates raw native logs in the source format (Windows Event XML, Okta JSON, GCP Cloud Audit JSON, etc.), ingests via `ingest_log`, and lets Chronicle's parser run. Slower (5+ minutes) but catches parser-vs-rule mismatches. Select per-validation via the "Ingestion path" dropdown in the UI, `--validation-mode` on the CLI, or the `validation_mode` parameter on `/api/validate`. Set `both` to gate on both paths. See [docs/COVERAGE.md](docs/COVERAGE.md#ingestion-path) for the full list.
 
 ## Tools (MCP)
 
