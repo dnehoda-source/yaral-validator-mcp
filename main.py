@@ -1411,6 +1411,8 @@ def verify_rule_quiet(rule_name: str, minutes_back: int = 5, validation_id: str 
 FIXTURE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures")
 FIXTURE_BUCKET = os.getenv("FIXTURE_BUCKET", "")
 FIXTURE_PREFIX = os.getenv("FIXTURE_PREFIX", "fixtures/")
+RULE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "saved_rules")
+RULE_PREFIX = os.getenv("RULE_PREFIX", "saved_rules/")
 
 
 def _sanitize_fixture_name(name: str) -> str:
@@ -1562,6 +1564,223 @@ def list_fixtures() -> str:
     try:
         items = _fixture_list()
         return json.dumps({"fixtures": items, "count": len(items), "backend": _fixture_backend()})
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+# ═══════════════════════════════════════════════════════════════
+# RULE LIBRARY — save and recall YARA-L rules
+# Same backend as fixtures; separate namespace so "Clear & Start Over"
+# doesn't wipe previous work.
+# ═══════════════════════════════════════════════════════════════
+
+
+def _rule_blob_name(name: str) -> str:
+    return f"{RULE_PREFIX}{name}.json"
+
+
+def _rule_write(name: str, payload: dict) -> str:
+    body = json.dumps(payload, indent=2)
+    if FIXTURE_BUCKET:
+        bucket = _gcs_bucket()
+        blob = bucket.blob(_rule_blob_name(name))
+        blob.upload_from_string(body, content_type="application/json")
+        return f"gs://{FIXTURE_BUCKET}/{_rule_blob_name(name)}"
+    os.makedirs(RULE_DIR, exist_ok=True)
+    path = os.path.join(RULE_DIR, f"{name}.json")
+    with open(path, "w") as f:
+        f.write(body)
+    return path
+
+
+def _rule_read(name: str) -> dict | None:
+    if FIXTURE_BUCKET:
+        bucket = _gcs_bucket()
+        blob = bucket.blob(_rule_blob_name(name))
+        if not blob.exists():
+            return None
+        return json.loads(blob.download_as_text())
+    path = os.path.join(RULE_DIR, f"{name}.json")
+    if not os.path.exists(path):
+        return None
+    with open(path) as f:
+        return json.load(f)
+
+
+def _rule_list() -> list[dict]:
+    items = []
+    if FIXTURE_BUCKET:
+        bucket = _gcs_bucket()
+        for blob in bucket.list_blobs(prefix=RULE_PREFIX):
+            if not blob.name.endswith(".json"):
+                continue
+            try:
+                d = json.loads(blob.download_as_text())
+                items.append({
+                    "file": blob.name.rsplit("/", 1)[-1],
+                    "rule_name": d.get("rule_name", ""),
+                    "saved_at": d.get("saved_at", ""),
+                    "source": d.get("source", "unknown"),
+                    "notes": d.get("notes", ""),
+                })
+            except Exception:
+                continue
+        return sorted(items, key=lambda r: r.get("saved_at", ""), reverse=True)
+    if not os.path.isdir(RULE_DIR):
+        return []
+    for fn in sorted(os.listdir(RULE_DIR)):
+        if not fn.endswith(".json"):
+            continue
+        try:
+            with open(os.path.join(RULE_DIR, fn)) as f:
+                d = json.load(f)
+            items.append({
+                "file": fn,
+                "rule_name": d.get("rule_name", fn[:-5]),
+                "saved_at": d.get("saved_at", ""),
+                "source": d.get("source", "unknown"),
+                "notes": d.get("notes", ""),
+            })
+        except Exception:
+            continue
+    return sorted(items, key=lambda r: r.get("saved_at", ""), reverse=True)
+
+
+def _rule_delete(name: str) -> bool:
+    if FIXTURE_BUCKET:
+        bucket = _gcs_bucket()
+        blob = bucket.blob(_rule_blob_name(name))
+        if not blob.exists():
+            return False
+        blob.delete()
+        return True
+    path = os.path.join(RULE_DIR, f"{name}.json")
+    if not os.path.exists(path):
+        return False
+    os.remove(path)
+    return True
+
+
+@app_mcp.tool()
+def save_rule(rule_name: str, rule_text: str, notes: str = "", source: str = "user") -> str:
+    """Persist a YARA-L rule so it can be recalled after 'Clear & Start Over'.
+    Stored in the same backend as fixtures (GCS if FIXTURE_BUCKET is set,
+    otherwise local disk) under a separate saved_rules/ namespace."""
+    try:
+        if not rule_name or not rule_text:
+            return json.dumps({"error": "rule_name and rule_text required"})
+        name = _sanitize_fixture_name(rule_name)
+        payload = {
+            "rule_name": rule_name,
+            "rule_text": rule_text,
+            "saved_at": datetime.now(timezone.utc).isoformat(),
+            "source": source,
+            "notes": notes,
+        }
+        location = _rule_write(name, payload)
+        return json.dumps({"status": "saved", "rule_name": rule_name, "location": location})
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+@app_mcp.tool()
+def load_rule(rule_name: str) -> str:
+    """Load a previously saved YARA-L rule by name."""
+    try:
+        name = _sanitize_fixture_name(rule_name)
+        rec = _rule_read(name)
+        if rec is None:
+            return json.dumps({"error": f"rule '{rule_name}' not found"})
+        return json.dumps(rec)
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+@app_mcp.tool()
+def list_saved_rules() -> str:
+    """List saved YARA-L rules with metadata (name, saved_at, source, notes)."""
+    try:
+        items = _rule_list()
+        return json.dumps({"rules": items, "count": len(items), "backend": _fixture_backend()})
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+@app_mcp.tool()
+def delete_saved_rule(rule_name: str) -> str:
+    """Remove a rule from the saved library."""
+    try:
+        name = _sanitize_fixture_name(rule_name)
+        ok = _rule_delete(name)
+        return json.dumps({"status": "deleted" if ok else "not_found", "rule_name": rule_name})
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+# ═══════════════════════════════════════════════════════════════
+# RULE GENERATION — produce a YARA-L rule from plain English
+# ═══════════════════════════════════════════════════════════════
+
+
+@app_mcp.tool()
+def generate_yara_l_rule(description: str, event_type_hint: str = "", severity: str = "MEDIUM") -> str:
+    """Generate a YARA-L 2.0 rule from a plain-English description.
+
+    description: what the rule should detect (e.g. "5 failed logins followed
+      by a successful one from the same IP within 10 minutes").
+    event_type_hint: optional UDM event_type to anchor generation
+      (USER_LOGIN, NETWORK_CONNECTION, PROCESS_LAUNCH, NETWORK_DNS, etc.).
+    severity: LOW / MEDIUM / HIGH / CRITICAL.
+
+    Returns {rule_name, rule_text, rationale}. The rule is NOT saved or
+    deployed automatically; pipe it through analyze_yara_l_rule first to
+    confirm it parses, then run_full_validation to confirm it fires.
+    """
+    sev = (severity or "MEDIUM").upper()
+    if sev not in ("INFORMATIONAL", "LOW", "MEDIUM", "HIGH", "CRITICAL"):
+        sev = "MEDIUM"
+    hint = event_type_hint.strip().upper() if event_type_hint else ""
+    hint_block = f"Target UDM event_type: {hint}." if hint else "Pick the correct UDM event_type from the description."
+
+    prompt = f"""Write a single YARA-L 2.0 rule that detects the behaviour described below.
+
+Description:
+{description}
+
+{hint_block}
+Severity: {sev}
+
+Hard requirements:
+- Output must be ONE YARA-L 2.0 rule. No multiple rules, no explanation, no
+  markdown fences in the rule body.
+- Use valid UDM field paths ($e.metadata.event_type, $e.principal.user.userid,
+  $e.principal.ip, $e.target.user.userid, $e.target.hostname,
+  $e.security_result.action, $e.network.application_protocol, etc.).
+- metadata.event_type must be a valid UDM enum string.
+- Include meta{{}} with author="yaral-validator-ai", description="<short>",
+  severity="{sev}", and mitre_attack_tactic / mitre_attack_technique when
+  obvious from the description.
+- If the rule needs counts (brute force, volume-based), use a match{{}} block
+  with a time window and a condition with #e >= N.
+- Do NOT reference external rules ($var.detection.*) — that makes it a
+  composite and the user will validate single-rule first.
+- Rule name must be a snake_case identifier, no spaces.
+
+Return JSON only (no markdown fence):
+{{
+  "rule_name": "<snake_case name>",
+  "rule_text": "<the rule, newlines preserved in the JSON string>",
+  "rationale": "<one paragraph explaining what the rule fires on and the UDM fields it uses>"
+}}"""
+
+    try:
+        result = _gemini(prompt, max_tokens=4096)
+        parsed = _extract_json(result)
+        if not isinstance(parsed, dict) or "rule_text" not in parsed:
+            return json.dumps({"error": f"Generator returned unexpected format: {str(result)[:400]}"})
+        parsed.setdefault("severity", sev)
+        parsed.setdefault("description", description)
+        return json.dumps(parsed, indent=2)
     except Exception as e:
         return json.dumps({"error": str(e)})
 
@@ -2285,6 +2504,66 @@ async def api_fixture_list(request: Request):
     return JSONResponse(json.loads(result))
 
 
+# ── RULE LIBRARY ENDPOINTS ─────────────────────────────────────
+@app.post("/api/rule/save")
+async def api_rule_save(request: Request):
+    if not _verify_google_token(request):
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    body = await request.json()
+    rule_name = body.get("rule_name", "")
+    rule_text = body.get("rule_text", "")
+    notes = body.get("notes", "")
+    source = body.get("source", "user")
+    if not rule_name or not rule_text:
+        return JSONResponse({"error": "rule_name and rule_text required"}, status_code=400)
+    result = save_rule(rule_name, rule_text, notes=notes, source=source)
+    return JSONResponse(json.loads(result))
+
+
+@app.post("/api/rule/load")
+async def api_rule_load(request: Request):
+    if not _verify_google_token(request):
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    body = await request.json()
+    rule_name = body.get("rule_name", "")
+    if not rule_name:
+        return JSONResponse({"error": "rule_name required"}, status_code=400)
+    result = load_rule(rule_name)
+    return JSONResponse(json.loads(result))
+
+
+@app.get("/api/rule/list")
+async def api_rule_list(request: Request):
+    if not _verify_google_token(request):
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    return JSONResponse(json.loads(list_saved_rules()))
+
+
+@app.post("/api/rule/delete")
+async def api_rule_delete(request: Request):
+    if not _verify_google_token(request):
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    body = await request.json()
+    rule_name = body.get("rule_name", "")
+    if not rule_name:
+        return JSONResponse({"error": "rule_name required"}, status_code=400)
+    return JSONResponse(json.loads(delete_saved_rule(rule_name)))
+
+
+@app.post("/api/generate-rule")
+async def api_generate_rule(request: Request):
+    if not _verify_google_token(request):
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    body = await request.json()
+    description = body.get("description", "").strip()
+    event_type_hint = body.get("event_type_hint", "")
+    severity = body.get("severity", "MEDIUM")
+    if not description:
+        return JSONResponse({"error": "description required"}, status_code=400)
+    result = generate_yara_l_rule(description, event_type_hint=event_type_hint, severity=severity)
+    return JSONResponse(json.loads(result))
+
+
 # ── BATCH VALIDATION ENDPOINT ──────────────────────────────────
 @app.post("/api/batch-validate")
 async def api_batch_validate(request: Request):
@@ -2388,9 +2667,14 @@ async def api_chat(request: Request):
             "- 'generate events / create test traffic / synthetic events' → generate_synthetic_events\n"
             "- 'ingest / send events / upload to Chronicle' → ingest_synthetic_events\n"
             "- 'check / verify / did rule fire / detection results' → verify_rule_triggered\n"
-            "- 'validate / test / run full test / end to end' → run_full_validation\n\n"
+            "- 'validate / test / run full test / end to end' → run_full_validation\n"
+            "- 'generate/write/create a rule for X / build a rule that detects Y' → generate_yara_l_rule\n"
+            "- 'save this rule / remember this rule' → save_rule\n"
+            "- 'load rule X / use the saved rule X' → load_rule\n"
+            "- 'list my saved rules / show me my rules' → list_saved_rules\n\n"
             "RULES:\n"
             "- When user pastes a YARA-L rule, always analyze it first with analyze_yara_l_rule\n"
+            "- When user asks to create / generate a new rule, use generate_yara_l_rule, then ALSO call save_rule with source='ai-generated' so it shows up in the saved rules panel\n"
             "- For full validation, use run_full_validation then tell the user to call verify in 2-5 minutes\n"
             "- Explain what synthetic events were generated and why they satisfy the rule conditions\n"
             "- After verify, clearly state PASS or FAIL with explanation\n"

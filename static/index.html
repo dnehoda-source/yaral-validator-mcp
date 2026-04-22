@@ -314,6 +314,10 @@ rule detect_lateral_movement {
         <button class="btn" onclick="saveCurrentAsFixture()" title="Save last successful events">💾 Save</button>
       </div>
       <div class="btn-row">
+        <button class="btn" onclick="openGenerateRule()" title="Describe a detection in English; Gemini writes the YARA-L rule">✨ Generate Rule</button>
+        <button class="btn" onclick="openSavedRules()" title="Load a previously analyzed or generated rule">📜 Rules</button>
+      </div>
+      <div class="btn-row">
         <button class="btn full" onclick="openMetricsPanel()" title="Aggregate pass/fail counts for this deployment">📈 Metrics</button>
       </div>
       <button class="btn full" style="border-color:var(--warn);color:var(--warn)" onclick="showVerifyPanel()">✅ Verify Rule Fired</button>
@@ -444,6 +448,154 @@ function onValidationModeChange() {
   const mode = document.getElementById('validation-mode').value;
   const wrap = document.getElementById('log-type-wrap');
   wrap.style.display = (mode === 'udm_direct') ? 'none' : 'flex';
+}
+
+// ── RULE LIBRARY / GENERATION ────────────────────────────────────
+
+async function autoSaveCurrentRule(ruleName, source) {
+  const ruleText = (document.getElementById('rule-input') || {}).value?.trim() || '';
+  if (!ruleText || !ruleName) return;
+  try {
+    await callApi('/api/rule/save', {rule_name: ruleName, rule_text: ruleText, source: source || 'analyzed'});
+  } catch (e) { /* non-fatal */ }
+}
+
+async function openSavedRules() {
+  clearEmpty();
+  addCard('📜 Saved Rules', 'Loading...', 'WORKING', 'info');
+  let data;
+  try { data = await callApi('/api/rule/list', null, 'GET'); }
+  catch(e) { if (e.message !== 'Unauthorized') addCard('Error', e.message, 'ERROR', 'err'); return; }
+  const cards = document.querySelectorAll('.result-card');
+  cards[cards.length - 1].remove();
+  if (data.error) { addCard('📜 Saved Rules — Error', data.error, 'ERROR', 'err'); return; }
+  const rules = data.rules || [];
+  if (!rules.length) {
+    addCard('📜 Saved Rules', 'No saved rules yet. Analyze a rule or use ✨ Generate Rule and it will be saved here.', 'EMPTY', 'warn');
+    return;
+  }
+
+  const area = document.getElementById('results-area');
+  const card = document.createElement('div');
+  card.className = 'result-card';
+  const rowsHtml = rules.map(r => {
+    const name = (r.rule_name || r.file || '').replace(/</g, '&lt;');
+    const when = (r.saved_at || '').slice(0, 19).replace('T', ' ');
+    const src  = (r.source || 'unknown').replace(/</g, '&lt;');
+    const notes = (r.notes || '').replace(/</g, '&lt;');
+    const safeName = encodeURIComponent(r.rule_name || r.file.replace(/\.json$/, ''));
+    return `<tr>
+      <td style="padding:4px 6px;font-family:var(--font);font-size:0.75rem">${name}</td>
+      <td style="padding:4px 6px;color:var(--muted);font-size:0.72rem">${when} UTC</td>
+      <td style="padding:4px 6px;color:var(--muted);font-size:0.72rem">${src}</td>
+      <td style="padding:4px 6px;color:var(--muted);font-size:0.7rem">${notes}</td>
+      <td style="padding:4px 6px;text-align:right">
+        <button class="btn" style="padding:3px 8px;font-size:0.7rem" onclick="loadSavedRule('${safeName}')">Load</button>
+        <button class="btn" style="padding:3px 8px;font-size:0.7rem;border-color:var(--danger);color:var(--danger)" onclick="deleteSavedRule('${safeName}')">Delete</button>
+      </td>
+    </tr>`;
+  }).join('');
+  card.innerHTML = `
+    <div class="result-card-header"><h3>📜 Saved Rules (${rules.length})</h3><span class="badge info">LIBRARY</span></div>
+    <div class="result-card-body" style="padding:0 8px 8px">
+      <table style="width:100%;border-collapse:collapse">
+        <thead><tr style="border-bottom:1px solid var(--border);text-align:left;font-size:0.7rem;color:var(--muted)">
+          <th style="padding:6px">Name</th><th style="padding:6px">Saved</th><th style="padding:6px">Source</th><th style="padding:6px">Notes</th><th></th>
+        </tr></thead>
+        <tbody>${rowsHtml}</tbody>
+      </table>
+    </div>`;
+  area.appendChild(card);
+  card.scrollIntoView({behavior:'smooth', block:'end'});
+}
+
+async function loadSavedRule(encodedName) {
+  const name = decodeURIComponent(encodedName);
+  try {
+    const data = await callApi('/api/rule/load', {rule_name: name});
+    if (data.error) { addCard('Load Rule — Error', data.error, 'ERROR', 'err'); return; }
+    document.getElementById('rule-input').value = data.rule_text || '';
+    const nameInput = document.getElementById('rule-name-input');
+    if (nameInput) nameInput.value = data.rule_name || '';
+    addCard('📜 Loaded', `Loaded rule '${data.rule_name}'. Click Analyze or Full Validation to use it.`, 'OK', 'ok');
+  } catch(e) { if (e.message !== 'Unauthorized') addCard('Error', e.message, 'ERROR', 'err'); }
+}
+
+async function deleteSavedRule(encodedName) {
+  const name = decodeURIComponent(encodedName);
+  if (!confirm(`Delete saved rule '${name}'?`)) return;
+  try {
+    await callApi('/api/rule/delete', {rule_name: name});
+    openSavedRules();
+  } catch(e) { if (e.message !== 'Unauthorized') addCard('Error', e.message, 'ERROR', 'err'); }
+}
+
+async function openGenerateRule() {
+  clearEmpty();
+  const area = document.getElementById('results-area');
+  const card = document.createElement('div');
+  card.className = 'result-card';
+  card.innerHTML = `
+    <div class="result-card-header"><h3>✨ Generate YARA-L Rule</h3><span class="badge info">AI</span></div>
+    <div class="result-card-body">
+      <p style="font-size:0.78rem;color:var(--muted);margin-bottom:6px">Describe the detection in plain English. Gemini writes the rule; you still analyze and validate it.</p>
+      <textarea id="gen-rule-desc" style="width:100%;min-height:90px;background:var(--bg);color:var(--accent2);border:1px solid var(--border);border-radius:6px;padding:8px;font-family:var(--font);font-size:0.78rem" placeholder="e.g. Detect 5 or more failed SSH logins followed by one successful login from the same IP within 10 minutes."></textarea>
+      <div style="display:flex;gap:8px;align-items:center;margin-top:8px;flex-wrap:wrap">
+        <label style="font-size:0.72rem;color:var(--muted)">Event type
+          <select id="gen-rule-event-type" style="background:var(--bg);color:var(--accent2);border:1px solid var(--border);border-radius:4px;padding:3px 6px;font-size:0.72rem">
+            <option value="">(auto)</option>
+            <option>USER_LOGIN</option>
+            <option>PROCESS_LAUNCH</option>
+            <option>NETWORK_CONNECTION</option>
+            <option>NETWORK_DNS</option>
+            <option>NETWORK_HTTP</option>
+            <option>FILE_CREATION</option>
+            <option>FILE_MODIFICATION</option>
+            <option>USER_RESOURCE_ACCESS</option>
+            <option>USER_RESOURCE_CREATION</option>
+            <option>USER_CHANGE_PASSWORD</option>
+            <option>EMAIL_TRANSACTION</option>
+          </select>
+        </label>
+        <label style="font-size:0.72rem;color:var(--muted)">Severity
+          <select id="gen-rule-severity" style="background:var(--bg);color:var(--accent2);border:1px solid var(--border);border-radius:4px;padding:3px 6px;font-size:0.72rem">
+            <option>LOW</option>
+            <option selected>MEDIUM</option>
+            <option>HIGH</option>
+            <option>CRITICAL</option>
+          </select>
+        </label>
+        <button class="btn primary" onclick="runGenerateRule()" style="margin-left:auto">▶ Generate</button>
+      </div>
+    </div>`;
+  area.appendChild(card);
+  card.scrollIntoView({behavior:'smooth', block:'end'});
+}
+
+async function runGenerateRule() {
+  const desc = document.getElementById('gen-rule-desc').value.trim();
+  if (!desc) { alert('Describe what the rule should detect.'); return; }
+  const event_type_hint = document.getElementById('gen-rule-event-type').value;
+  const severity = document.getElementById('gen-rule-severity').value;
+  addCard('✨ Generating rule...', 'Asking Gemini for YARA-L...', 'WORKING', 'info');
+  let data;
+  try { data = await callApi('/api/generate-rule', {description: desc, event_type_hint, severity}); }
+  catch(e) { if (e.message !== 'Unauthorized') addCard('Error', e.message, 'ERROR', 'err'); return; }
+  const cards = document.querySelectorAll('.result-card');
+  cards[cards.length - 1].remove();
+  if (data.error) { addCard('✨ Generate — Error', data.error, 'ERROR', 'err'); return; }
+
+  document.getElementById('rule-input').value = data.rule_text || '';
+  const nameInput = document.getElementById('rule-name-input');
+  if (nameInput && data.rule_name) nameInput.value = data.rule_name;
+
+  try {
+    await callApi('/api/rule/save', {rule_name: data.rule_name, rule_text: data.rule_text, source: 'ai-generated', notes: desc.slice(0, 200)});
+  } catch(e) { /* non-fatal */ }
+
+  addCard('✨ Generated Rule: ' + (data.rule_name || '(unnamed)'),
+          (data.rationale || '') + '\n\n— — —\n\n' + (data.rule_text || ''),
+          'GENERATED', 'ok');
 }
 
 function clearEmpty() {
@@ -579,6 +731,7 @@ async function runAnalyze() {
       if (name && !document.getElementById('rule-name-input').value) {
         document.getElementById('rule-name-input').value = name;
       }
+      if (name) autoSaveCurrentRule(name, 'analyzed');
     }
   } catch(e) {
     if (e.message !== 'Unauthorized') addCard('Error', e.message, 'ERROR', 'err');
@@ -648,6 +801,7 @@ async function runFullValidation() {
     document.getElementById('rule-name-input').value = lastAnalysis.rule_name;
   }
   const effectiveRuleName = document.getElementById('rule-name-input').value.trim() || lastAnalysis.rule_name || '';
+  if (effectiveRuleName) autoSaveCurrentRule(effectiveRuleName, 'analyzed');
 
   // ── Step 2: Enable Rule ──────────────────────────────────────
   addPipeline('Enable Rule');
