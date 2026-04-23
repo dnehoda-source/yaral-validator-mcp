@@ -422,7 +422,37 @@ def generate_synthetic_events(analysis_json: str, count: int = 5) -> str:
         for i in range(actual_count)
     ]
 
+    raw_rule = analysis.get("raw_rule", "")
+    joins = analysis.get("entity_joins", []) or []
+    event_vars = analysis.get("event_variables", []) or []
+    has_match_block = bool(re.search(r"\bmatch\s*:", raw_rule, re.IGNORECASE)) if raw_rule else False
+    branch_count = len(re.findall(r"\bor\b", raw_rule, re.IGNORECASE)) + 1 if raw_rule else 1
+
+    join_guidance = ""
+    if joins or has_match_block:
+        join_guidance = (
+            "\nENTITY JOIN REQUIREMENT: This rule has a match block. EVERY generated event "
+            "MUST share identical values for the join key(s) below. Pick one concrete value for "
+            f"each join key and reuse it on every event.\nJoin keys: {json.dumps(joins) if joins else 'parse from rule'}\n"
+        )
+
+    single_var_branch_guidance = ""
+    if len(event_vars) <= 1 and has_match_block:
+        single_var_branch_guidance = (
+            f"\nSINGLE-VARIABLE MULTI-BRANCH RULE: The events block uses one event variable with "
+            f"~{branch_count} OR'd behavior branches. The condition fires only when DISTINCT branches "
+            "match across the window. Distribute the events across the branches: produce AT LEAST ONE "
+            "event per branch, and then repeat events for the more common branches up to the total count. "
+            "Read the raw rule below and make sure each generated command_line / file path LITERALLY "
+            "matches one of the regexes shown there.\n"
+        )
+
     prompt = f"""Generate {actual_count} synthetic UDM event objects that will trigger this YARA-L rule.
+
+RAW RULE (use the exact regex patterns and field paths below; do not invent shapes):
+```
+{raw_rule}
+```
 
 Rule analysis:
 {json.dumps(analysis, indent=2)}
@@ -430,13 +460,16 @@ Rule analysis:
 Event breakdown needed: {json.dumps(breakdown) if breakdown else "see condition block"}
 Use THESE exact timestamps (current UTC time — live rules will evaluate them):
 {json.dumps(timestamps)}
-
+{join_guidance}{single_var_branch_guidance}
 Rules for generating valid UDM events:
-- metadata.event_type must be a valid UDM enum string: USER_LOGIN, NETWORK_CONNECTION, PROCESS_LAUNCH, NETWORK_HTTP, FILE_CREATION, USER_RESOURCE_ACCESS
+- metadata.event_type must be a valid UDM enum: USER_LOGIN, NETWORK_CONNECTION, PROCESS_LAUNCH, NETWORK_HTTP, FILE_CREATION, USER_RESOURCE_ACCESS, USER_RESOURCE_CREATION, NETWORK_DNS, etc.
 - metadata.event_timestamp: use the timestamps above, one per event
 - metadata.product_name: use "synthetic-test"
 - principal.ip and target.ip must be JSON arrays of strings: ["10.0.0.5"]
 - principal.user.userid and target.user.userid: plain strings like "jsmith@corp.local"
+- principal.hostname / target.hostname: plain strings (use the SAME hostname on every event when the rule has a match block joining on hostname)
+- principal.process.command_line and target.process.command_line: the LITERAL string must match the regex in the rule. Do not paraphrase. If the regex is `/whoami \\/priv/` the command_line must contain `whoami /priv` exactly.
+- principal.process.file.full_path and target.file.full_path: same rule — literal match required.
 - security_result must be a JSON array; security_result[0].action must be a JSON array with ONE of: "ALLOW", "BLOCK"
 - Do NOT include: process.pid (causes type errors), extensions, ingestion_labels, metadata.id
 - For correlated rules (same user across events): use identical principal.user.userid and principal.ip across all events
@@ -446,17 +479,13 @@ Return ONLY this JSON, no markdown:
   "events": [
     {{
       "metadata": {{"event_timestamp": "TIMESTAMP_0", "event_type": "USER_LOGIN", "product_name": "synthetic-test"}},
-      "principal": {{"ip": ["10.0.0.5"], "user": {{"userid": "jsmith@corp.local"}}}},
+      "principal": {{"ip": ["10.0.0.5"], "user": {{"userid": "jsmith@corp.local"}}, "hostname": "WS-01"}},
       "target": {{"application": "vpn", "user": {{"userid": "jsmith@corp.local"}}}},
       "security_result": [{{"action": ["BLOCK"]}}]
     }},
     ...{actual_count - 1} more events...
   ]
-}}
-
-Example for brute-force (5 BLOCK + 1 ALLOW, same user):
-- events 1-5: security_result=[{{"action":["BLOCK"]}}], same user/IP
-- event 6:    security_result=[{{"action":["ALLOW"]}}], same user/IP"""
+}}"""
 
     try:
         result = _gemini(prompt, max_tokens=8192)
