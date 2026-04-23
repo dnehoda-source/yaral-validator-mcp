@@ -357,10 +357,15 @@ def analyze_yara_l_rule(rule_text: str) -> str:
 - time_window: string or null
 - trigger_summary: string (max 300 chars, single line)
 - synthetic_event_hints: object with key=variable name, value=object of field:value pairs to use
-- min_event_count: integer — the MINIMUM total number of events required to satisfy the condition block.
-  For rules with count conditions like "#fail >= 5 and #success >= 1", this is 5+1=6.
-  For simple single-event rules this is 1. Always set this accurately.
-- event_breakdown: object mapping each event variable to the minimum count needed, e.g. {{"$fail": 5, "$success": 1}}
+- min_event_count: integer — the MINIMUM total number of DISTINCT events required to satisfy the condition block.
+  Rules of thumb (apply the LARGEST matching case):
+    * Simple single-event rule with no match block and no count condition: 1.
+    * Count conditions on raw events ("#fail >= 5 and #success >= 1"): sum them (5+1=6).
+    * Rules with a `match:` block (entity join + time window): the rule needs at least 2 events that share the match key, so floor at 2.
+    * Rules whose condition references an OUTCOME variable that is a FLAG SUM (e.g. "$total_stages >= 2" where $total_stages is max(if(...)) + max(if(...)) + max(if(...))): the threshold N is the number of DISTINCT behaviors that must be observed. Set min_event_count to that N.
+    * Rules with multiple event variables combined with AND in the events block: sum their per-variable minimum counts.
+  When in doubt, err HIGH rather than low; it is always safe for the generator to produce more events than strictly required.
+- event_breakdown: object mapping each event variable to the minimum count needed, e.g. {{"$fail": 5, "$success": 1}}. For rules with a single event variable but a stage-count condition, use the variable name as key and the total threshold as the count (e.g. {{"$event": 2}} for a rule that needs 2 distinct behavior matches).
 
 Keep ALL string values on a single line. No literal newlines inside strings. Escape backslashes.
 For complex rules with many event variables, focus on the MINIMUM subset needed to trigger the rule.
@@ -376,6 +381,22 @@ Return ONLY valid compact JSON, no markdown, no explanation."""
         result = _gemini(prompt)
         parsed = _extract_json(result)
         parsed["raw_rule"] = rule_text
+        # Backstop: if the rule has a match block (entity join + window) the
+        # generator needs more than one event. If the condition references an
+        # outcome variable with a >= N threshold, floor min_event_count at N.
+        try:
+            min_count = int(parsed.get("min_event_count") or 1)
+        except Exception:
+            min_count = 1
+        if re.search(r"\bmatch\s*:", rule_text, re.IGNORECASE):
+            min_count = max(min_count, 2)
+        m = re.search(r"\$[A-Za-z_]\w*\s*>=\s*(\d+)", rule_text)
+        if m:
+            try:
+                min_count = max(min_count, int(m.group(1)))
+            except ValueError:
+                pass
+        parsed["min_event_count"] = min_count
         return json.dumps(parsed, indent=2)
     except Exception as e:
         return json.dumps({"error": str(e), "raw_rule": rule_text})

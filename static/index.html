@@ -848,7 +848,7 @@ async function runFullValidation() {
 
   if (!usedFixture && useUdm) {
     try {
-      const minCount = lastAnalysis.min_event_count || 5;
+      const minCount = Math.max(5, lastAnalysis.min_event_count || 5);
       genData = await callApi('/api/generate', {analysis_json: JSON.stringify(lastAnalysis), count: minCount});
     } catch(e) {
       if (e.message !== 'Unauthorized') finishPipeline('err', 'Generate failed: ' + e.message);
@@ -863,7 +863,7 @@ async function runFullValidation() {
   let nativeData = null;
   if (useParser) {
     try {
-      const minCount = lastAnalysis.min_event_count || 5;
+      const minCount = Math.max(5, lastAnalysis.min_event_count || 5);
       nativeData = await callApi('/api/generate-native', {analysis_json: JSON.stringify(lastAnalysis), log_type: logType, count: minCount});
     } catch(e) {
       if (e.message !== 'Unauthorized') finishPipeline('err', 'Native generate failed: ' + e.message);
