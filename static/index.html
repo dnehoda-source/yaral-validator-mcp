@@ -622,6 +622,97 @@ function addCard(title, body, badgeText, badgeClass) {
   return card;
 }
 
+function renderAnalysisCard(analysis) {
+  clearEmpty();
+  const area = document.getElementById('results-area');
+  const esc = (s) => String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const chip = (label, value, color) => value
+    ? `<span style="display:inline-flex;align-items:center;gap:6px;background:${color || 'rgba(255,255,255,.04)'};border:1px solid var(--border,#333);border-radius:4px;padding:3px 10px;font-size:11px;color:var(--text-primary,#e0e0e0)"><span style="color:var(--text-muted,#888);font-weight:500">${esc(label)}</span>${esc(value)}</span>`
+    : '';
+
+  const severity = (analysis.severity || '').toUpperCase();
+  const sevColors = {LOW:'rgba(59,130,246,.12)', MEDIUM:'rgba(234,179,8,.14)', HIGH:'rgba(249,115,22,.14)', CRITICAL:'rgba(239,68,68,.18)'};
+  const reqEvents = analysis.required_events || [];
+  const reqFields = analysis.required_fields || [];
+  const joins = analysis.entity_joins || [];
+  const breakdown = analysis.event_breakdown || {};
+
+  const eventTypeChips = reqEvents.map(e => chip(e.variable || '$e', e.event_type || '')).filter(Boolean).join('');
+  const breakdownChips = Object.entries(breakdown).map(([v,c]) => chip(v, `${c} event${c===1?'':'s'}`, 'rgba(0,255,136,.08)')).join('');
+  const joinsHtml = joins.length
+    ? `<div style="margin-top:10px"><div style="font-size:11px;color:var(--text-muted,#888);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:6px">Entity joins</div>
+        ${joins.map(j => `<div style="font-family:'SF Mono',monospace;font-size:12px;color:var(--green,#4ade80);padding:3px 0">• ${esc(j)}</div>`).join('')}
+      </div>`
+    : '';
+
+  const fieldsRows = reqFields.slice(0, 50).map(f => `
+    <tr>
+      <td style="padding:4px 8px;font-family:monospace;font-size:11px;color:var(--text-primary,#e0e0e0);white-space:nowrap">${esc(f.field || '')}</td>
+      <td style="padding:4px 8px;text-align:center;color:var(--text-muted,#888);font-family:monospace;font-size:11px">${esc(f.operator || '=')}</td>
+      <td style="padding:4px 8px;font-family:monospace;font-size:11px;color:var(--green,#4ade80);word-break:break-all">${esc(f.value || '')}</td>
+    </tr>`).join('');
+  const fieldsHtml = reqFields.length
+    ? `<div style="margin-top:12px"><div style="font-size:11px;color:var(--text-muted,#888);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:6px">Required fields (${reqFields.length})</div>
+        <table style="width:100%;border-collapse:collapse;background:rgba(255,255,255,.02);border:1px solid var(--border,#333);border-radius:4px;overflow:hidden">
+          <thead><tr style="background:rgba(255,255,255,.03);border-bottom:1px solid var(--border,#333);font-size:10px;color:var(--text-muted,#888);text-transform:uppercase">
+            <th style="padding:6px 8px;text-align:left;font-weight:500">Field</th>
+            <th style="padding:6px 8px;text-align:center;font-weight:500;width:40px">Op</th>
+            <th style="padding:6px 8px;text-align:left;font-weight:500">Value</th>
+          </tr></thead>
+          <tbody>${fieldsRows}</tbody>
+        </table>${reqFields.length > 50 ? `<div style="font-size:10px;color:var(--text-muted,#888);margin-top:4px">Showing first 50 of ${reqFields.length}</div>` : ''}
+      </div>`
+    : '';
+
+  const summaryHtml = analysis.trigger_summary
+    ? `<div style="margin-top:12px;padding:10px 12px;background:rgba(0,255,136,.05);border-left:3px solid var(--green,#4ade80);border-radius:3px;font-size:13px;line-height:1.5;color:var(--text-primary,#e0e0e0)">${esc(analysis.trigger_summary)}</div>`
+    : '';
+
+  const descHtml = analysis.description
+    ? `<div style="color:var(--text-muted,#888);font-size:12px;margin-top:4px">${esc(analysis.description)}</div>`
+    : '';
+
+  const card = document.createElement('div');
+  card.className = 'result-card';
+  card.innerHTML = `
+    <div class="result-card-header" onclick="toggleCard(this)">
+      <h3>🔍 Rule Analysis</h3>
+      <div style="display:flex;gap:8px;align-items:center">
+        <span class="badge ok">ANALYZED</span>
+        <span class="collapse-toggle">▼</span>
+      </div>
+    </div>
+    <div class="result-card-body" style="padding:14px 16px">
+      <div style="display:flex;align-items:flex-start;gap:12px;flex-wrap:wrap">
+        <div style="flex:1;min-width:220px">
+          <div style="font-family:'SF Mono',monospace;font-size:14px;color:var(--green,#4ade80);font-weight:600">${esc(analysis.rule_name || '(unnamed)')}</div>
+          ${descHtml}
+        </div>
+        ${severity ? `<span style="background:${sevColors[severity] || 'rgba(255,255,255,.04)'};border:1px solid var(--border,#333);color:var(--text-primary,#e0e0e0);padding:3px 10px;border-radius:4px;font-size:11px;font-weight:600;letter-spacing:0.3px">${esc(severity)}</span>` : ''}
+      </div>
+
+      <div style="margin-top:10px;display:flex;flex-wrap:wrap;gap:6px">
+        ${chip('events:', (analysis.event_variables || []).length || (reqEvents.length || 1), 'rgba(74,222,128,.08)')}
+        ${analysis.time_window ? chip('window:', analysis.time_window, 'rgba(234,179,8,.10)') : ''}
+        ${chip('min_count:', analysis.min_event_count || 1, 'rgba(139,92,246,.10)')}
+        ${eventTypeChips}
+        ${breakdownChips}
+      </div>
+
+      ${summaryHtml}
+      ${joinsHtml}
+      ${fieldsHtml}
+
+      <details style="margin-top:14px">
+        <summary style="cursor:pointer;color:var(--text-muted,#888);font-size:11px;text-transform:uppercase;letter-spacing:0.5px">Raw JSON</summary>
+        <pre style="margin-top:8px;font-size:11px;color:var(--text-muted,#888);background:rgba(0,0,0,.25);padding:10px;border-radius:4px;overflow:auto;max-height:280px">${esc(JSON.stringify(analysis, null, 2))}</pre>
+      </details>
+    </div>`;
+  area.appendChild(card);
+  card.scrollIntoView({behavior: 'smooth', block: 'end'});
+  return card;
+}
+
 function toggleCard(header) {
   const body = header.nextElementSibling;
   const toggle = header.querySelector('.collapse-toggle');
@@ -726,7 +817,7 @@ async function runAnalyze() {
       addCard('🔍 Analysis — Error', data.error, 'ERROR', 'err');
     } else {
       lastAnalysis = data;
-      addCard('🔍 Rule Analysis', JSON.stringify(lastAnalysis, null, 2), 'DONE', 'ok');
+      renderAnalysisCard(lastAnalysis);
       const name = lastAnalysis.rule_name || '';
       if (name && !document.getElementById('rule-name-input').value) {
         document.getElementById('rule-name-input').value = name;
@@ -796,7 +887,7 @@ async function runFullValidation() {
   }
   if (analyzeData.error) { finishPipeline('err', analyzeData.error); return; }
   lastAnalysis = analyzeData;
-  addCard('🔍 Rule Analysis', JSON.stringify(lastAnalysis, null, 2), 'DONE', 'ok');
+  renderAnalysisCard(lastAnalysis);
   if (!document.getElementById('rule-name-input').value && lastAnalysis.rule_name) {
     document.getElementById('rule-name-input').value = lastAnalysis.rule_name;
   }
