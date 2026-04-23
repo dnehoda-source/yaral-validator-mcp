@@ -40,7 +40,7 @@ def _gemini_url() -> str:
         f"/locations/{GEMINI_LOCATION}/publishers/google/models/{GEMINI_MODEL}:generateContent"
     )
 OAUTH_CLIENT_ID    = os.getenv("OAUTH_CLIENT_ID", "")
-ALLOWED_EMAILS     = set(e.strip() for e in os.getenv("ALLOWED_EMAILS", "carter@linus.joonix.net,dnehoda@gmail.com").split(",") if e.strip())
+ALLOWED_EMAILS     = set(e.strip() for e in os.getenv("ALLOWED_EMAILS", "").split(",") if e.strip())
 PORT               = int(os.getenv("PORT", "8080"))
 
 CHRONICLE_BASE = (
@@ -2385,10 +2385,100 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
 app.add_middleware(SecurityHeadersMiddleware)
 
 
+# ── RATE LIMIT ──────────────────────────────────────────────────
+import collections as _collections
+RATE_LIMIT_RPM = int(os.getenv("RATE_LIMIT_RPM", "60"))
+_rate_windows: dict = {}
+
+
+class RateLimitMiddleware(BaseHTTPMiddleware):
+    """Per-principal sliding window. Uses the Bearer-token email claim
+    when present, falls back to X-Forwarded-For, finally to peer IP."""
+
+    EXEMPT = ("/health", "/api/auth-config", "/static", "/")
+
+    async def dispatch(self, request, call_next):
+        path = request.url.path or ""
+        if any(path == p or (p.endswith("/") and path.startswith(p)) for p in self.EXEMPT):
+            return await call_next(request)
+
+        key = None
+        auth = request.headers.get("authorization", "")
+        if auth.startswith("Bearer "):
+            try:
+                import base64 as _b64
+                payload = auth[7:].split(".")[1]
+                payload += "=" * (-len(payload) % 4)
+                claims = json.loads(_b64.urlsafe_b64decode(payload))
+                if claims.get("email"):
+                    key = f"email:{claims['email']}"
+            except Exception:
+                pass
+        if not key:
+            xff = request.headers.get("x-forwarded-for", "").split(",")[0].strip()
+            key = f"ip:{xff or (request.client.host if request.client else '')}"
+
+        now = time.time()
+        window = _rate_windows.setdefault(key, _collections.deque())
+        while window and (now - window[0]) > 60.0:
+            window.popleft()
+        if len(window) >= max(1, RATE_LIMIT_RPM):
+            retry = max(1, int(60.0 - (now - window[0])))
+            return JSONResponse(
+                {"error": "rate_limit_exceeded", "detail": f"{RATE_LIMIT_RPM} rpm hit", "retry_after_seconds": retry},
+                status_code=429,
+                headers={"Retry-After": str(retry)},
+            )
+        window.append(now)
+        return await call_next(request)
+
+
+app.add_middleware(RateLimitMiddleware)
+
+
+# ── AUDIT LOG ───────────────────────────────────────────────────
+# One JSONL record per sensitive action. Key fields: ts, email,
+# action, rule_name, event_count, validation_id, outcome. Lives in
+# the same GCS bucket as fixtures when FIXTURE_BUCKET is set,
+# otherwise local disk.
+
+def _audit(action: str, email: str, **extra):
+    rec = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "email": email or "anonymous",
+        "action": action,
+    }
+    for k, v in extra.items():
+        try:
+            json.dumps({k: v})
+            rec[k] = v
+        except Exception:
+            rec[k] = str(v)[:300]
+    line = json.dumps(rec, default=str) + "\n"
+    try:
+        if FIXTURE_BUCKET:
+            bucket = _gcs_bucket()
+            blob_name = f"{os.getenv('AUDIT_PREFIX', 'audit/')}{datetime.now(timezone.utc).strftime('%Y-%m-%d')}.jsonl"
+            blob = bucket.blob(blob_name)
+            existing = blob.download_as_text() if blob.exists() else ""
+            blob.upload_from_string(existing + line, content_type="application/x-ndjson")
+        else:
+            path = os.getenv("AUDIT_PATH", os.path.join(os.path.dirname(os.path.abspath(__file__)), "audit.jsonl"))
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(line)
+    except Exception as exc:
+        logger.warning(f"audit write failed: {exc}")
+
+
 @app.get("/health")
-async def health():
-    return {"status": "ok", "version": "1.0.0", "service": "yaral-validator",
-            "chronicle_project": SECOPS_PROJECT_ID, "chronicle_customer": SECOPS_CUSTOMER_ID}
+async def health(request: Request):
+    """Minimal unauthenticated health; tenant IDs only for authed callers."""
+    base = {"status": "ok", "version": "1.0.0", "service": "yaral-validator"}
+    email = _verify_google_token(request)
+    if email and email != "dev":
+        base["chronicle_project"] = SECOPS_PROJECT_ID
+        base["chronicle_customer"] = SECOPS_CUSTOMER_ID
+    return base
 
 
 @app.get("/api/auth-config")
@@ -2436,14 +2526,19 @@ async def api_generate(request: Request):
 
 @app.post("/api/ingest")
 async def api_ingest(request: Request):
-    if not _verify_google_token(request):
+    email = _verify_google_token(request)
+    if not email:
         return JSONResponse({"error": "Unauthorized"}, status_code=401)
     body = await request.json()
     events_json = body.get("events_json", "")
     if not events_json:
         return JSONResponse({"error": "No events provided"}, status_code=400)
     result = ingest_synthetic_events(events_json)
-    return JSONResponse(json.loads(result))
+    parsed = json.loads(result)
+    _audit("ingest", email, event_count=parsed.get("event_count"),
+           validation_id=parsed.get("validation_id"), method=parsed.get("method"),
+           status=parsed.get("status"))
+    return JSONResponse(parsed)
 
 
 @app.post("/api/generate-native")
@@ -2462,7 +2557,8 @@ async def api_generate_native(request: Request):
 
 @app.post("/api/ingest-native")
 async def api_ingest_native(request: Request):
-    if not _verify_google_token(request):
+    email = _verify_google_token(request)
+    if not email:
         return JSONResponse({"error": "Unauthorized"}, status_code=401)
     body = await request.json()
     logs_json = body.get("logs_json", "")
@@ -2470,12 +2566,16 @@ async def api_ingest_native(request: Request):
     if not logs_json or not log_type:
         return JSONResponse({"error": "logs_json and log_type required"}, status_code=400)
     result = ingest_native_logs(logs_json, log_type=log_type)
-    return JSONResponse(json.loads(result))
+    parsed = json.loads(result)
+    _audit("ingest_native", email, log_type=log_type, event_count=parsed.get("event_count"),
+           validation_id=parsed.get("validation_id"), status=parsed.get("status"))
+    return JSONResponse(parsed)
 
 
 @app.post("/api/validate")
 async def api_validate(request: Request):
-    if not _verify_google_token(request):
+    email = _verify_google_token(request)
+    if not email:
         return JSONResponse({"error": "Unauthorized"}, status_code=401)
     body = await request.json()
     rule_text = body.get("rule", "").strip()
@@ -2489,6 +2589,9 @@ async def api_validate(request: Request):
     result = json.loads(result_raw)
     session_store.add_validation(session_id, {"ts": datetime.now(timezone.utc).isoformat(), **result})
     metrics.record_validation(result.get("rule_name") or rule_name, _outcome_bucket(result))
+    _audit("validate", email, rule_name=result.get("rule_name") or rule_name,
+           validation_mode=validation_mode, log_type=log_type,
+           status=result.get("status"), validation_id=result.get("validation_id"))
     resp = JSONResponse(result)
     resp.set_cookie("yv_session", session_id, max_age=86400, samesite="lax")
     return resp
