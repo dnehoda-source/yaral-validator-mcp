@@ -1014,8 +1014,9 @@ async function runFullValidation() {
 }
 
 async function autoPollVerify(ruleName, validationId) {
-  const MAX_ATTEMPTS = 12;
+  const MAX_ATTEMPTS = 30;
   const INTERVAL_MS  = 30000;
+  const totalMinutes = (MAX_ATTEMPTS * INTERVAL_MS) / 60000;
   const area = document.getElementById('results-area');
 
   const verifyCard = document.createElement('div');
@@ -1026,7 +1027,7 @@ async function autoPollVerify(ruleName, validationId) {
       <span class="badge warn" id="verify-badge">CHECKING</span>
     </div>
     <div class="result-card-body">
-      <div id="verify-status" style="font-size:0.85rem;margin-bottom:8px">Polling for detections — checking every 30s for up to 6 minutes.</div>
+      <div id="verify-status" style="font-size:0.85rem;margin-bottom:8px">Polling for detections — checking every 30s for up to ${totalMinutes} minutes.</div>
       <div class="progress-bar-wrap"><div id="verify-fill" class="progress-fill" style="background:var(--warn);width:0%"></div></div>
     </div>`;
   area.appendChild(verifyCard);
@@ -1043,7 +1044,7 @@ async function autoPollVerify(ruleName, validationId) {
     if (fillEl)   fillEl.style.width = (attempt / MAX_ATTEMPTS * 100) + '%';
 
     try {
-      const verifyData = await callApi('/api/verify', {rule_name: ruleName, validation_id: validationId, minutes_back: 10});
+      const verifyData = await callApi('/api/verify', {rule_name: ruleName, validation_id: validationId, minutes_back: 20});
       if (verifyData.error) {
         if (statusEl) statusEl.textContent = `Attempt ${attempt}/${MAX_ATTEMPTS} — API error: ${verifyData.error}. Retrying...`;
         continue;
