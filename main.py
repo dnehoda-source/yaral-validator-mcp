@@ -1827,10 +1827,50 @@ Return JSON only (no markdown fence):
 }}"""
 
     try:
-        result = _gemini(prompt, max_tokens=4096)
-        parsed = _extract_json(result)
+        result = _gemini(prompt, max_tokens=16384)
+        parsed = None
+        try:
+            parsed = _extract_json(result)
+        except Exception:
+            parsed = None
         if not isinstance(parsed, dict) or "rule_text" not in parsed:
-            return json.dumps({"error": f"Generator returned unexpected format: {str(result)[:400]}"})
+            # Fallback: Gemini hit the token cap or emitted malformed JSON.
+            # Try to salvage the rule text by locating the opening 'rule NAME {'
+            # and matching braces. Keep what we have rather than returning an
+            # error the user has to manually recover from.
+            m = re.search(r'rule\s+[A-Za-z_][A-Za-z0-9_]*\s*\{', result)
+            if m:
+                start = m.start()
+                depth = 0
+                end = start
+                for i, ch in enumerate(result[start:], start=start):
+                    if ch == '{':
+                        depth += 1
+                    elif ch == '}':
+                        depth -= 1
+                        if depth == 0:
+                            end = i + 1
+                            break
+                if depth != 0:
+                    # Rule is truncated; close any open string / event block /
+                    # outcome block / braces so downstream analyzers still
+                    # treat it as a well-formed rule.
+                    body = result[start:]
+                    if body.count('"') % 2 == 1:
+                        body += '"'
+                    body += '\n  condition:\n    $e\n' + ('}' * max(1, depth))
+                    rule_text = body
+                else:
+                    rule_text = result[start:end]
+                name_m = re.match(r'rule\s+([A-Za-z_][A-Za-z0-9_]*)', rule_text)
+                parsed = {
+                    "rule_name": (name_m.group(1) if name_m else "ai_generated_rule"),
+                    "rule_text": rule_text,
+                    "rationale": "Recovered from truncated Gemini response; review before deploying.",
+                    "truncated": True,
+                }
+            else:
+                return json.dumps({"error": f"Generator returned unexpected format: {str(result)[:400]}"})
         parsed.setdefault("severity", sev)
         parsed.setdefault("description", description)
         return json.dumps(parsed, indent=2)
