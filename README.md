@@ -136,7 +136,7 @@ You can still get raw JSON from the API for programmatic consumers.
 ## Deploy to Cloud Run
 
 ```bash
-git clone https://github.com/dnehoda-source/yaral-validator-mcp.git
+git clone https://github.com/dadohen/yaral-validator-mcp.git
 cd yaral-validator-mcp
 
 gcloud builds submit --tag gcr.io/YOUR_PROJECT/yaral-validator:latest .
@@ -156,7 +156,7 @@ gcloud run deploy yaral-validator \
 ## Run Locally
 
 ```bash
-git clone https://github.com/dnehoda-source/yaral-validator-mcp.git
+git clone https://github.com/dadohen/yaral-validator-mcp.git
 cd yaral-validator-mcp
 
 pip install -r requirements.txt

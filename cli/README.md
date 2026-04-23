@@ -8,7 +8,7 @@ to plug into CI (GitHub Actions, Cloud Build, Jenkins) but runs locally too.
 Copy `validate_changed.py` into your rules repo, or fetch it at runtime:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/dnehoda-source/yaral-validator-mcp/master/cli/validate_changed.py \
+curl -fsSL https://raw.githubusercontent.com/dadohen/yaral-validator-mcp/master/cli/validate_changed.py \
   -o validate_changed.py
 pip install requests
 ```

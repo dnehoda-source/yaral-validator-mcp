@@ -46,7 +46,7 @@ jobs:
         run: |
           pip install requests
           # Fetch the CLI from the validator repo. Pin to a tag in production.
-          curl -fsSL https://raw.githubusercontent.com/dnehoda-source/yaral-validator-mcp/master/cli/validate_changed.py \
+          curl -fsSL https://raw.githubusercontent.com/dadohen/yaral-validator-mcp/master/cli/validate_changed.py \
             -o validate_changed.py
 
       - name: Auth to Google Cloud
