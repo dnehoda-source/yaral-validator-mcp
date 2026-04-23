@@ -25,6 +25,20 @@ SECOPS_PROJECT_ID  = os.getenv("SECOPS_PROJECT_ID", "")
 SECOPS_CUSTOMER_ID = os.getenv("SECOPS_CUSTOMER_ID", "")
 SECOPS_REGION      = os.getenv("SECOPS_REGION", "us")
 GEMINI_MODEL       = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_LOCATION    = os.getenv("GEMINI_LOCATION", "us-central1")
+
+
+def _gemini_url() -> str:
+    """Preview Gemini models (gemini-3.1-pro-preview etc.) only serve from
+    the non-regional 'global' location. Default remains us-central1."""
+    if GEMINI_LOCATION == "global":
+        host = "aiplatform.googleapis.com"
+    else:
+        host = f"{GEMINI_LOCATION}-aiplatform.googleapis.com"
+    return (
+        f"https://{host}/v1beta1/projects/{SECOPS_PROJECT_ID}"
+        f"/locations/{GEMINI_LOCATION}/publishers/google/models/{GEMINI_MODEL}:generateContent"
+    )
 OAUTH_CLIENT_ID    = os.getenv("OAUTH_CLIENT_ID", "")
 ALLOWED_EMAILS     = set(e.strip() for e in os.getenv("ALLOWED_EMAILS", "carter@linus.joonix.net,dnehoda@gmail.com").split(",") if e.strip())
 PORT               = int(os.getenv("PORT", "8080"))
@@ -315,8 +329,7 @@ def _gemini(prompt: str, system: str = "", max_tokens: int = 8192, deterministic
             return cached
 
     token = _get_adc_token()
-    url = (f"https://us-central1-aiplatform.googleapis.com/v1/projects/{SECOPS_PROJECT_ID}"
-           f"/locations/us-central1/publishers/google/models/{GEMINI_MODEL}:generateContent")
+    url = _gemini_url()
     body: dict = {
         "contents": [{"role": "user", "parts": [{"text": prompt}]}],
         "generationConfig": {"maxOutputTokens": max_tokens, "temperature": temperature},
@@ -2749,8 +2762,7 @@ async def api_chat(request: Request):
                                 "parameters": {"type": "object", "properties": props, "required": req}})
 
         token = _get_adc_token()
-        gemini_url = (f"https://us-central1-aiplatform.googleapis.com/v1/projects/{SECOPS_PROJECT_ID}"
-                      f"/locations/us-central1/publishers/google/models/{GEMINI_MODEL}:generateContent")
+        gemini_url = _gemini_url()
         headers_ai = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
         system_text = (
