@@ -1151,17 +1151,29 @@ async function runNegativeTests(analysis, ruleName) {
 let lastGeneratedEvents = null;
 
 async function saveCurrentAsFixture() {
-  const ruleName = (document.getElementById('rule-name-input').value.trim()) ||
-                   (lastAnalysis && lastAnalysis.rule_name) || '';
-  if (!ruleName) { alert('Run analyze first so we have a rule name to key the fixture by.'); return; }
-  if (!lastGeneratedEvents) { alert('No events to save. Run Generate or Full Validation first.'); return; }
+  if (!lastGeneratedEvents) {
+    alert('No events to save. Run Generate or Full Validation first so there are events to cache.');
+    return;
+  }
+  const defaultName = (document.getElementById('rule-name-input').value.trim()) ||
+                      (lastAnalysis && lastAnalysis.rule_name) || '';
+  const ruleName = window.prompt(
+    'Name this fixture (leave blank to use the current rule name):',
+    defaultName
+  );
+  if (ruleName === null) return;   // user cancelled
+  const finalName = (ruleName || '').trim() || defaultName;
+  if (!finalName) {
+    alert('A fixture needs a name. Either type one into this prompt or analyze a rule first so its name is available.');
+    return;
+  }
   try {
     const data = await callApi('/api/fixture/save', {
-      rule_name: ruleName,
+      rule_name: finalName,
       events_json: JSON.stringify(lastGeneratedEvents),
     });
     if (data.error) { addCard('💾 Fixture Save — Error', data.error, 'ERROR', 'err'); return; }
-    addCard('💾 Fixture Saved', `Rule: ${ruleName}\nEvents: ${data.event_count}\nPath: ${data.path}\n\nFuture validations can replay this fixture instead of regenerating events.`, 'SAVED', 'ok');
+    addCard('💾 Fixture Saved', `Name: ${finalName}\nEvents: ${data.event_count}\nPath: ${data.path}\n\nReplay later by putting the fixture name in the rule-name field before Full Validation.`, 'SAVED', 'ok');
   } catch(e) { if (e.message !== 'Unauthorized') addCard('Error', e.message, 'ERROR', 'err'); }
 }
 
