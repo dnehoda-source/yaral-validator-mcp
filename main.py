@@ -214,7 +214,8 @@ def _get_adc_token() -> str:
 
 def _verify_google_token(request: Request) -> str | None:
     if not OAUTH_CLIENT_ID:
-        return "dev"
+        logger.warning("OAUTH_CLIENT_ID not configured -- all requests rejected")
+        return None
     auth = request.headers.get("Authorization", "")
     if not auth.startswith("Bearer "):
         return None
@@ -229,6 +230,10 @@ def _verify_google_token(request: Request) -> str | None:
     except Exception as e:
         logger.warning(f"Token verify failed: {e}")
         return None
+
+MAX_RULE_TEXT_LEN = 65536
+MAX_EVENT_COUNT = 50
+MAX_MINUTES_BACK = 60
 
 def _repair_json(text: str) -> str:
     """Apply a sequence of repairs to make Gemini output parseable as JSON."""
@@ -2402,21 +2407,8 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         if any(path == p or (p.endswith("/") and path.startswith(p)) for p in self.EXEMPT):
             return await call_next(request)
 
-        key = None
-        auth = request.headers.get("authorization", "")
-        if auth.startswith("Bearer "):
-            try:
-                import base64 as _b64
-                payload = auth[7:].split(".")[1]
-                payload += "=" * (-len(payload) % 4)
-                claims = json.loads(_b64.urlsafe_b64decode(payload))
-                if claims.get("email"):
-                    key = f"email:{claims['email']}"
-            except Exception:
-                pass
-        if not key:
-            xff = request.headers.get("x-forwarded-for", "").split(",")[0].strip()
-            key = f"ip:{xff or (request.client.host if request.client else '')}"
+        client_ip = request.client.host if request.client else "unknown"
+        key = f"ip:{client_ip}"
 
         now = time.time()
         window = _rate_windows.setdefault(key, _collections.deque())
@@ -2488,6 +2480,8 @@ async def auth_config():
 
 @app.get("/api/history")
 async def api_history(request: Request):
+    if not _verify_google_token(request):
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
     sid = request.cookies.get("yv_session", "")
     return JSONResponse({"validations": session_store.get_validations(sid)})
 
@@ -2507,6 +2501,8 @@ async def api_analyze(request: Request):
     rule_text = body.get("rule", "").strip()
     if not rule_text:
         return JSONResponse({"error": "No rule provided"}, status_code=400)
+    if len(rule_text) > MAX_RULE_TEXT_LEN:
+        return JSONResponse({"error": f"Rule text exceeds {MAX_RULE_TEXT_LEN} byte limit"}, status_code=400)
     result = analyze_yara_l_rule(rule_text)
     return JSONResponse(json.loads(result))
 
@@ -2517,7 +2513,7 @@ async def api_generate(request: Request):
         return JSONResponse({"error": "Unauthorized"}, status_code=401)
     body = await request.json()
     analysis_json = body.get("analysis_json", "")
-    count = int(body.get("count", 5))
+    count = min(int(body.get("count", 5)), MAX_EVENT_COUNT)
     if not analysis_json:
         return JSONResponse({"error": "No analysis provided"}, status_code=400)
     result = generate_synthetic_events(analysis_json, count=count)
@@ -2548,7 +2544,7 @@ async def api_generate_native(request: Request):
     body = await request.json()
     analysis_json = body.get("analysis_json", "")
     log_type = body.get("log_type", "").strip()
-    count = int(body.get("count", 5))
+    count = min(int(body.get("count", 5)), MAX_EVENT_COUNT)
     if not analysis_json or not log_type:
         return JSONResponse({"error": "analysis_json and log_type required"}, status_code=400)
     result = generate_native_log_events(analysis_json, log_type=log_type, count=count)
@@ -2579,10 +2575,12 @@ async def api_validate(request: Request):
         return JSONResponse({"error": "Unauthorized"}, status_code=401)
     body = await request.json()
     rule_text = body.get("rule", "").strip()
+    if len(rule_text) > MAX_RULE_TEXT_LEN:
+        return JSONResponse({"error": f"Rule text exceeds {MAX_RULE_TEXT_LEN} byte limit"}, status_code=400)
     rule_name = body.get("rule_name", "")
     validation_mode = body.get("validation_mode", "udm_direct")
     log_type = body.get("log_type", "")
-    session_id = body.get("session_id") or request.cookies.get("yv_session") or str(uuid.uuid4())
+    session_id = request.cookies.get("yv_session") or str(uuid.uuid4())
     if not rule_text:
         return JSONResponse({"error": "No rule provided"}, status_code=400)
     result_raw = run_full_validation(rule_text, rule_name=rule_name, validation_mode=validation_mode, log_type=log_type)
@@ -2593,7 +2591,7 @@ async def api_validate(request: Request):
            validation_mode=validation_mode, log_type=log_type,
            status=result.get("status"), validation_id=result.get("validation_id"))
     resp = JSONResponse(result)
-    resp.set_cookie("yv_session", session_id, max_age=86400, samesite="lax")
+    resp.set_cookie("yv_session", session_id, max_age=86400, samesite="lax", httponly=True, secure=True)
     return resp
 
 
@@ -2626,7 +2624,7 @@ async def api_verify(request: Request):
     body = await request.json()
     rule_name = body.get("rule_name", "")
     validation_id = body.get("validation_id", "")
-    minutes_back = int(body.get("minutes_back", 10))
+    minutes_back = min(int(body.get("minutes_back", 10)), MAX_MINUTES_BACK)
     result = verify_rule_triggered(rule_name, minutes_back=minutes_back, validation_id=validation_id)
     parsed = json.loads(result)
     if parsed.get("triggered") is True or parsed.get("status") == "FIRED":
@@ -2643,7 +2641,7 @@ async def api_generate_negative(request: Request):
         return JSONResponse({"error": "Unauthorized"}, status_code=401)
     body = await request.json()
     analysis_json = body.get("analysis_json", "")
-    count = int(body.get("count", 3))
+    count = min(int(body.get("count", 3)), MAX_EVENT_COUNT)
     if not analysis_json:
         return JSONResponse({"error": "No analysis provided"}, status_code=400)
     result = generate_negative_events(analysis_json, count=count)
@@ -2670,7 +2668,7 @@ async def api_verify_quiet(request: Request):
     body = await request.json()
     rule_name = body.get("rule_name", "")
     validation_id = body.get("validation_id", "")
-    minutes_back = int(body.get("minutes_back", 5))
+    minutes_back = min(int(body.get("minutes_back", 5)), MAX_MINUTES_BACK)
     result = verify_rule_quiet(rule_name, minutes_back=minutes_back, validation_id=validation_id)
     return JSONResponse(json.loads(result))
 
@@ -2721,6 +2719,8 @@ async def api_rule_save(request: Request):
     body = await request.json()
     rule_name = body.get("rule_name", "")
     rule_text = body.get("rule_text", "")
+    if len(rule_text) > MAX_RULE_TEXT_LEN:
+        return JSONResponse({"error": f"Rule text exceeds {MAX_RULE_TEXT_LEN} byte limit"}, status_code=400)
     notes = body.get("notes", "")
     source = body.get("source", "user")
     if not rule_name or not rule_text:
@@ -2797,6 +2797,8 @@ async def api_analyze_composite(request: Request):
     rule_text = body.get("rule_text", body.get("rule", "")).strip()
     if not rule_text:
         return JSONResponse({"error": "rule_text required"}, status_code=400)
+    if len(rule_text) > MAX_RULE_TEXT_LEN:
+        return JSONResponse({"error": f"Rule text exceeds {MAX_RULE_TEXT_LEN} byte limit"}, status_code=400)
     result = analyze_composite_rule(rule_text)
     return JSONResponse(json.loads(result))
 
@@ -2819,6 +2821,8 @@ async def api_cascade_validate(request: Request):
         return JSONResponse({"error": "Unauthorized"}, status_code=401)
     body = await request.json()
     rule_text = body.get("rule_text", "").strip()
+    if len(rule_text) > MAX_RULE_TEXT_LEN:
+        return JSONResponse({"error": f"Rule text exceeds {MAX_RULE_TEXT_LEN} byte limit"}, status_code=400)
     base_rule_names = body.get("base_rule_names", "")
     if not rule_text:
         return JSONResponse({"error": "rule_text required"}, status_code=400)
@@ -2832,7 +2836,9 @@ async def api_composite_static_validate(request: Request):
         return JSONResponse({"error": "Unauthorized"}, status_code=401)
     body = await request.json()
     rule_text = body.get("rule_text", body.get("rule", "")).strip()
-    wait_seconds = int(body.get("wait_seconds", 120))
+    if len(rule_text) > MAX_RULE_TEXT_LEN:
+        return JSONResponse({"error": f"Rule text exceeds {MAX_RULE_TEXT_LEN} byte limit"}, status_code=400)
+    wait_seconds = min(int(body.get("wait_seconds", 120)), 300)
     if not rule_text:
         return JSONResponse({"error": "rule_text required"}, status_code=400)
     result = composite_static_validate(rule_text, wait_seconds=wait_seconds)
@@ -2850,7 +2856,7 @@ async def api_chat(request: Request):
     message = body.get("message", "").strip()
     if not message:
         return JSONResponse({"error": "No message"}, status_code=400)
-    session_id = body.get("session_id") or request.cookies.get("yv_session") or str(uuid.uuid4())
+    session_id = request.cookies.get("yv_session") or str(uuid.uuid4())
     session_store.get_or_create(session_id)
 
     try:
@@ -2938,7 +2944,7 @@ async def api_chat(request: Request):
         session_store.append_history(session_id, "model", final_text.strip() or "Done.")
 
         resp_out = JSONResponse({"response": final_text.strip() or "Done.", "tool_log": tool_log, "session_id": session_id})
-        resp_out.set_cookie("yv_session", session_id, max_age=86400, samesite="lax")
+        resp_out.set_cookie("yv_session", session_id, max_age=86400, samesite="lax", httponly=True, secure=True)
         return resp_out
 
     except Exception as e:
@@ -2946,8 +2952,24 @@ async def api_chat(request: Request):
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
-# Mount static and MCP
-app.mount("/mcp", app_mcp.sse_app())
+# Auth-gated MCP mount -- rejects unauthenticated MCP clients
+class _AuthGatedMCP:
+    """ASGI middleware that requires Cloud Run IAM or a valid Bearer token before forwarding to the MCP SSE app."""
+    def __init__(self, mcp_app):
+        self._mcp = mcp_app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http":
+            from starlette.requests import Request as _Req
+            req = _Req(scope, receive)
+            if not _verify_google_token(req):
+                from starlette.responses import JSONResponse as _JR
+                resp = _JR({"error": "Unauthorized"}, status_code=401)
+                await resp(scope, receive, send)
+                return
+        await self._mcp(scope, receive, send)
+
+app.mount("/mcp", _AuthGatedMCP(app_mcp.sse_app()))
 app.mount("/", StaticFiles(directory="static", html=True), name="static")
 
 if __name__ == "__main__":
